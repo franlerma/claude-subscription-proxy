@@ -283,8 +283,11 @@ function renderBlocks(content: unknown, nameToAlias: Map<string, string>): strin
  */
 const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
+const CWD_HINT =
+  "File tools run in the caller's project, not the proxy. Ignore <env> cwd; pass the user's path verbatim. Never touch proxy files."
+
 function callerSystemBlock(system: string): string {
-  return ["<caller_system_prompt>", system, "</caller_system_prompt>"].join("\n")
+  return ["<caller_system_prompt>", system, CWD_HINT, "</caller_system_prompt>"].join("\n")
 }
 
 function buildPrompt(messages: any[], nameToAlias: Map<string, string>): string {
@@ -292,9 +295,7 @@ function buildPrompt(messages: any[], nameToAlias: Map<string, string>): string 
     messages.length === 1 && messages[0]?.role === "user"
       ? renderBlocks(messages[0].content, nameToAlias)
       : [
-          "Below is the conversation so far. Write the next assistant turn.",
-          "If you need a tool, call it through the normal tool-calling mechanism. Never type <tool_call> or <tool_result> tags yourself: they only appear in this history.",
-          "",
+          "Conversation history. Write the next assistant turn. Call tools normally; never type <tool_call>/<tool_result>.",
           "<conversation>",
           messages
             .map((m) => {
