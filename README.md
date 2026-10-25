@@ -152,6 +152,42 @@ source ~/.zshrc
 
 Now just run `oc` to start OpenCode with Claude Max.
 
+## Auto-start on Linux (systemd)
+
+Example systemd unit (adjust `User`, `Environment` (`PATH`), `WorkingDirectory`, and `ExecStart` to match your host):
+
+```ini
+[Unit]
+Description=Claude Code Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=PATH=/root/.asdf/shims:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=/opt/claude-subscription-proxy
+ExecStart=/root/.asdf/shims/bun run proxy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Save it to `/etc/systemd/system/claude-subscription-proxy.service`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-subscription-proxy
+```
+
+Check status and logs:
+
+```bash
+systemctl status claude-subscription-proxy
+journalctl -u claude-subscription-proxy -f
+```
+
 ## Model Mapping
 
 | OpenCode Model | Claude SDK |
