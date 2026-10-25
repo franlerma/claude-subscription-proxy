@@ -35,9 +35,8 @@ This project builds on [opencode-claude-max-proxy](https://github.com/rynfar/ope
 - **Prompt caching** — Claude Code's system prompt is kept as a stable, cacheable prefix, so later turns in a conversation read from the prompt cache (~40k+ tokens) instead of rewriting the full context every turn.
 - **First-party billing preserved** — the caller's system prompt is injected after Claude Code's dynamic-boundary marker, so Anthropic still bills the request against the subscription and never degrades it to a third-party "extra usage" call.
 - **Multi-turn session resume** — each caller session maps to a persistent Claude Code transcript, so every turn sends only the newest message instead of replaying the whole history. The mapping survives proxy restarts.
-- **Session integrity checks** — before resuming, the proxy verifies that the caller's history still contains the assistant turn the transcript holds. Compaction, regenerate/retry, truncation or a second writer triggers a full replay instead of appending to stale history.
-- **Stable tool prefix** — tool definitions are deduplicated, sorted and schema-canonicalized, so a caller that reorders tools or JSON keys does not silently invalidate the whole prompt cache.
-- **Frozen caller system prompt** — a system prompt that changes mid-conversation is delivered as a conversation message instead of rewriting Claude Code's cached system block and every tool definition ahead of it.
+- **Session integrity checks** — before resuming, the proxy verifies that the caller's history still contains the assistant turn the transcript holds (message count + assistant role). Compaction, retry, truncation or a second writer triggers a full replay instead of appending to stale history.
+- **Per-turn serialization** — the next turn of a conversation waits for the previous one to record its transcript and session id, so a fast client cannot trigger a full replay by racing the resume.
 - **Environment hardening** — ambient `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_FORCE_GLOBAL_CACHE`, `MAX_THINKING_TOKENS` and cache-disabling flags are removed before the CLI starts, so they cannot change billing, thinking budget or caching.
 - **MCP tool federation** — OpenCode's MCP tools are federated to the underlying Claude Code process, so tool calls keep working across turns.
 - **Per-conversation warm pool** — pre-started Claude Code processes resume a conversation's transcript, cutting time-to-first-byte without losing context.
@@ -65,9 +64,8 @@ The Claude Agent SDK exists specifically to let Max subscribers use Claude progr
 | **Prompt caching** | Keeps the system prompt a stable cacheable prefix so multi-turn sessions read from cache |
 | **First-party billing** | Preserves subscription billing — never degrades to third-party "extra usage" |
 | **Session resume** | Persists and resumes transcripts so later turns send only the newest message |
-| **Session integrity** | Detects compaction, retries and branching and replays instead of resuming stale history |
-| **Stable cache prefix** | Sorts/dedupes tools and canonicalizes JSON schemas so reordering cannot bust the cache |
-| **System prompt freeze** | Applies mid-session system prompt changes as conversation messages, keeping the cached prefix warm |
+| **Session integrity** | Detects compaction, retries and truncation and replays instead of resuming stale history |
+| **Per-turn serialization** | Waits for the previous turn to record its transcript so a fast client cannot force a full replay |
 | **MCP tool federation** | Federates OpenCode's MCP tools to the underlying Claude Code process |
 | **Streaming support** | Real-time SSE streaming just like the real API |
 | **Warm pool** | Pre-started processes resume a conversation, cutting time-to-first-byte |
@@ -212,12 +210,11 @@ journalctl -u claude-subscription-proxy -f
 | `CLAUDE_PROXY_WARM_POOL` | 3 | Max number of pre-started Claude CLI processes kept ready, one per conversation (model + max tokens + tool set + caller session). Each warm process resumes that conversation's transcript, serves exactly one request, and is replaced. Set to the expected number of concurrent conversations, or `0` to disable. |
 | `CLAUDE_PROXY_WARM_TTL_MS` | 60000 | Idle time before an unused warm process is killed |
 | `CLAUDE_PROXY_SESSION` | 1 (enabled) | Resume the CLI session for each caller session so later turns send only the new message instead of the whole history. Uses the caller's session header (`x-opencode-session-id`, `x-session-id`, etc.) or a fingerprint of the leading messages. Set to `0` to send the full history every time. |
-| `CLAUDE_PROXY_SESSION_TTL_MS` | 1800000 | Idle time before a session mapping is forgotten and its session file, transcript and scratch data are deleted |
+| `CLAUDE_PROXY_SESSION_TTL_MS` | 3600000 | Idle time before a session mapping is forgotten and its session file, transcript and scratch data are deleted. One hour matches the subscription prompt-cache lifetime; 30 minutes wasted warm cache on breaks. |
 | `CLAUDE_PROXY_SESSION_MAX` | 256 | Max tracked sessions; the least recently used one is evicted |
+| `CLAUDE_PROXY_SESSION_FINGERPRINT` | 1 | Number of leading messages hashed to identify a conversation when the caller sends no session header. Keep it at `1`; with more, the second message changes the key on turn two and starts a new transcript. |
 | `CLAUDE_PROXY_SESSION_FLUSH_MS` | 750 | Time granted to the CLI to write its transcript before the process is torn down |
 | `CLAUDE_PROXY_CONFIG_DIR` | `~/.claude-proxy` | Where resumed transcripts and the per-session map (`sessions/<sha256>.json`) live. Kept separate from `~/.claude` so TTL cleanup never touches a real Claude Code install; credentials are symlinked from there on startup. |
-| `CLAUDE_PROXY_TOOL_CHOICE_FILTER` | 0 (off) | When `1`, a `tool_choice: {type:"tool"}` request only sends that tool's schema. Saves schema tokens on the forced turn, but changes the cached tool prefix, so it is opt-in. |
-| `CLAUDE_PROXY_SYSTEM_PROMPT_FREEZE` | 1 (on) | Keep the first caller system prompt in the cached system block and deliver later changes as a conversation message (Claude Code's own resume behavior). Set to `0` to send the live system prompt every turn. |
 | `CLAUDE_PROXY_AMBIENT_ENV` | 0 (off) | When `1`, keeps ambient Anthropic/CLI environment variables instead of stripping them. Debug escape hatch: ambient `ANTHROPIC_API_KEY` silently switches to API-key billing, `CLAUDE_CODE_FORCE_GLOBAL_CACHE` switches to the global cache, and `MAX_THINKING_TOKENS` turns thinking on for every turn. |
 
 
@@ -227,7 +224,7 @@ The first request of each conversation is a miss (full startup); later turns of 
 
 When `CLAUDE_PROXY_SESSION` is enabled and the caller sends a session header, the proxy remembers the CLI session id for that conversation. The first turn sends the full history and persists a transcript; later turns send only the newest message and pass `resume`, so the CLI replays its own transcript instead of the proxy re-sending everything. That is what keeps token usage flat as a conversation grows.
 
-Reuse falls back to the full history whenever it cannot be trusted: the conversation is new, compaction/regeneration shortened or rewrote the history, the assistant message the caller replays differs from the one the transcript holds, or the remembered transcript has disappeared from disk.
+Reuse falls back to the full history whenever it cannot be trusted: the conversation is new, compaction/retry shortened or rewrote the history, the assistant turn is missing from the slot the transcript expects, or the remembered transcript has disappeared from disk.
 
 Each mapping is written atomically to its own file under `CLAUDE_PROXY_CONFIG_DIR/sessions/` (one `sha256(callerKey).json` per conversation), so a proxy restart resumes the same transcripts instead of paying a cold cache write for every conversation. One session's write or corruption cannot take down the others, and expiry deletes exactly one file. The old single `sessions.json` is migrated automatically on first start (kept as `sessions.json.migrated` until the TTL sweep removes it). On restart the system prompt is re-frozen from the first resumed request.
 

@@ -55,44 +55,6 @@ const CLIENT_MCP_SERVER = "client"
 const CLIENT_TOOL_PREFIX = `mcp__${CLIENT_MCP_SERVER}__`
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
-/**
- * JSON with object keys sorted recursively. Tool inputs and tool schemas are serialized on every
- * turn; sorting their keys keeps the cached prefix byte-identical when a caller re-serializes the
- * same JSON in a different key order (a common source of silent cache misses).
- */
-export function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    const json = JSON.stringify(value)
-    return json === undefined ? "null" : json
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
-  const record = value as Record<string, unknown>
-  const keys = Object.keys(record).sort()
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`
-}
-
-/**
- * Sorts only JSON Schema `properties` maps, recursively. Property order has no meaning for the
- * model or for validation, but it does change the bytes of the MCP tool definition. Leaves arrays
- * (enum, anyOf, oneOf, required) untouched because their order can carry meaning.
- */
-export function canonicalizeSchema(schema: any): any {
-  if (Array.isArray(schema)) return schema.map(canonicalizeSchema)
-  if (!schema || typeof schema !== "object") return schema
-  const out: Record<string, any> = {}
-  for (const key of Object.keys(schema).sort()) {
-    const value = schema[key]
-    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
-      const props: Record<string, any> = {}
-      for (const prop of Object.keys(value).sort()) props[prop] = canonicalizeSchema(value[prop])
-      out[key] = props
-    } else {
-      out[key] = canonicalizeSchema(value)
-    }
-  }
-  return out
-}
-
 function resolveClaudeExecutable(): string {
   // 1. Try the SDK's bundled cli.js (same dir as this module's SDK)
   try {
@@ -210,20 +172,13 @@ interface ClientTools {
  * Dedupe by name, then sort by code point. The tool list is the first part of the API request:
  * reordering it invalidates the entire prompt cache even though the definitions are unchanged.
  */
-function canonicalToolList(tools: Array<{ name: string; description?: string; input_schema?: any }>): any[] {
-  const unique = new Map<string, { name: string; description?: string; input_schema?: any }>()
-  for (const t of tools) {
-    if (t && typeof t.name === "string" && t.name && !unique.has(t.name)) unique.set(t.name, t)
-  }
-  return [...unique.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-}
-
 function buildClientTools(tools: Array<{ name: string; description?: string; input_schema?: any }>): ClientTools {
   const nameToAlias = new Map<string, string>()
   const aliasToName = new Map<string, string>()
   const maxLen = 64 - CLIENT_TOOL_PREFIX.length
 
-  const sdkTools = canonicalToolList(tools)
+  const sdkTools = tools
+    .filter((t) => t && typeof t.name === "string" && t.name)
     .map((t, i) => {
       let alias = t.name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, maxLen)
       if (aliasToName.has(alias)) alias = `${alias.slice(0, maxLen - 4)}_${i}`
@@ -232,7 +187,7 @@ function buildClientTools(tools: Array<{ name: string; description?: string; inp
       return tool(
         alias,
         t.description || t.name,
-        schemaToShape(canonicalizeSchema(t.input_schema)) as any,
+        schemaToShape(t.input_schema) as any,
         // Never meant to run: the turn is aborted as soon as the model emits the tool_use.
         async () => ({
           content: [{ type: "text" as const, text: "This tool is executed by the client, not by the proxy." }],
@@ -293,7 +248,7 @@ function renderBlocks(content: unknown, nameToAlias: Map<string, string>): strin
       case "tool_use": {
         const alias = nameToAlias.get(block.name) ?? block.name
         parts.push(
-          `<tool_call id="${block.id}" name="${CLIENT_TOOL_PREFIX}${alias}">${canonicalJson(block.input ?? {})}</tool_call>`
+          `<tool_call id="${block.id}" name="${CLIENT_TOOL_PREFIX}${alias}">${JSON.stringify(block.input ?? {})}</tool_call>`
         )
         break
       }
@@ -311,29 +266,6 @@ function renderBlocks(content: unknown, nameToAlias: Map<string, string>): strin
     }
   }
   return parts.join("\n")
-}
-
-/**
- * Identity of an assistant turn as the caller will echo it back. Thinking blocks are ignored by
- * `renderBlocks`, so a caller that replays or strips them still matches.
- */
-export function assistantFingerprint(content: unknown): string {
-  return createHash("sha1").update(renderBlocks(content, new Map())).digest("hex")
-}
-
-/**
- * A caller whose system prompt changes mid-conversation would otherwise rewrite Claude Code's
- * whole cached system block (and every tool definition ahead of it). Claude Code itself keeps the
- * prompt a resumed conversation started with. We do the same: keep the first prompt in the cached
- * system block and deliver later changes as a normal conversation message, which only appends.
- */
-function systemUpdateBlock(system: string): string {
-  return [
-    "<caller_system_prompt_update>",
-    system,
-    "</caller_system_prompt_update>",
-    "The caller's system instructions above replace the earlier <caller_system_prompt>. Follow them for the rest of the conversation."
-  ].join("\n")
 }
 
 /**
@@ -519,12 +451,6 @@ const WARM_POOL_SIZE = envInt("CLAUDE_PROXY_WARM_POOL", 3)
 // Shorter than it was: a warm process now holds a live transcript, and reusing a stale one across
 // writers is worse than a cold start.
 const WARM_POOL_TTL_MS = Math.max(1000, envInt("CLAUDE_PROXY_WARM_TTL_MS", 60_000))
-// Opt-in: send only the forced tool's schema when the caller uses tool_choice={type:"tool"}. Saves
-// schema tokens on that turn but invalidates the cached tool prefix both ways, so off by default.
-const FILTER_FORCED_TOOL = envInt("CLAUDE_PROXY_TOOL_CHOICE_FILTER", 0) > 0
-// Keep the first caller system prompt in the cached system block (Claude Code's own resume
-// behavior). Set to 0 to send the live prompt every turn, at the cost of invalidating the prefix.
-const FREEZE_SYSTEM_PROMPT = envInt("CLAUDE_PROXY_SYSTEM_PROMPT_FREEZE", 1) > 0
 
 // ---------------------------------------------------------------------------------------
 // Session continuity (resume)
@@ -537,13 +463,13 @@ const FREEZE_SYSTEM_PROMPT = envInt("CLAUDE_PROXY_SYSTEM_PROMPT_FREEZE", 1) > 0
 // Transcripts are kept in the proxy's own config dir so TTL cleanup never touches a real Claude
 // Code installation.
 //   CLAUDE_PROXY_SESSION           1 enables resume (default 1); 0 disables it
-//   CLAUDE_PROXY_SESSION_TTL_MS    idle time before a mapping is forgotten (default 1800000)
+//   CLAUDE_PROXY_SESSION_TTL_MS    idle time before a mapping is forgotten (default 3600000)
 //   CLAUDE_PROXY_SESSION_MAX       max tracked sessions, least recently used evicted (default 256)
 //   CLAUDE_PROXY_CONFIG_DIR        where transcripts live (default <home>/.claude-proxy)
 // ---------------------------------------------------------------------------------------
 
 const SESSION_MODE = envInt("CLAUDE_PROXY_SESSION", 1) > 0
-const SESSION_TTL_MS = Math.max(1000, envInt("CLAUDE_PROXY_SESSION_TTL_MS", 1_800_000))
+const SESSION_TTL_MS = Math.max(1000, envInt("CLAUDE_PROXY_SESSION_TTL_MS", 3_600_000))
 const SESSION_MAX = Math.max(1, envInt("CLAUDE_PROXY_SESSION_MAX", 256))
 // Time granted to the CLI to flush its transcript before its process is torn down.
 const SESSION_FLUSH_MS = Math.max(0, envInt("CLAUDE_PROXY_SESSION_FLUSH_MS", 750))
@@ -551,7 +477,9 @@ const SESSION_CONFIG_DIR =
   process.env.CLAUDE_PROXY_CONFIG_DIR?.trim() ||
   join(homedir(), ".claude-proxy")
 // How many leading messages define a conversation identity when the caller sends no session header.
-const SESSION_FINGERPRINT_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_SESSION_FINGERPRINT", 2))
+// Keep this at 1: a conversation's first request often has only one message, so hashing two would
+// change the key on turn two (the second message appears) and silently start a new transcript.
+const SESSION_FINGERPRINT_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_SESSION_FINGERPRINT", 1))
 
 // ---------------------------------------------------------------------------------------
 // Environment hardening
@@ -591,19 +519,14 @@ function buildCliEnv(): Env {
 }
 
 /**
- * Everything the proxy knows about one caller conversation. `messageCount` and `assistantHash`
- * describe the exact prefix the CLI transcript should contain after the last turn; they are what
- * lets a later request prove that resuming is safe.
+ * Everything the proxy knows about one caller conversation. `messageCount` describes where the
+ * assistant turn the transcript holds should sit in the caller's history on the next request, which
+ * is what lets a later request prove that resuming is safe.
  */
 interface SessionState {
   id: string
   messageCount: number
-  assistantHash: string | null
   updatedAt: number
-  /** Caller system prompt used for the cached system block (start of the conversation). */
-  systemBaseline: string | null
-  /** Hash of the most recent caller system prompt, so it is only injected when it changes. */
-  systemLastHash: string | null
   /** In-memory TTL timer; never persisted. */
   timer?: ReturnType<typeof setTimeout>
 }
@@ -615,12 +538,13 @@ const LEGACY_SESSION_FILE = join(SESSION_CONFIG_DIR, "sessions.json")
 const SESSION_TMP_TTL_MS = 5 * 60_000
 let sessionsLoaded = false
 /**
- * A caller or gateway that normalizes assistant text would never match our fingerprint. After two
- * mismatches for the same conversation we stop hashing that conversation and fall back to the
- * structural checks (length + role), instead of replaying the whole history on every turn.
+ * A caller can send the next turn as soon as it receives the assistant message, while this turn is
+ * still draining the CLI for its `result` (which carries the session id and flushes the transcript).
+ * Without this gate the next request finds no state and replays the whole history. Wait for the
+ * previous turn of the same conversation to remember its state first.
  */
-const hashFailures = new Map<string, number>()
-const hashSuspended = new Set<string>()
+const pendingTurns = new Map<string, Promise<void>>()
+const PENDING_TURN_TIMEOUT_MS = Math.max(60_000, SESSION_FLUSH_MS + 60_000)
 
 /**
  * Stable identity for a conversation when the caller sends no session header.
@@ -674,10 +598,7 @@ function readSessionFile(path: string): { key: string; state: SessionState } | n
       state: {
         id: parsed.id,
         messageCount: Number.isFinite(parsed.messages) ? Math.max(0, Math.floor(parsed.messages)) : 0,
-        assistantHash: typeof parsed.assistant === "string" ? parsed.assistant : null,
-        updatedAt: parsed.updated,
-        systemBaseline: null,
-        systemLastHash: null
+        updatedAt: parsed.updated
       }
     }
   } catch {
@@ -699,7 +620,6 @@ function writeSessionFile(key: string, state: SessionState): boolean {
         key,
         id: state.id,
         messages: state.messageCount,
-        assistant: state.assistantHash,
         updated: state.updatedAt
       }),
       { mode: 0o600 }
@@ -727,10 +647,7 @@ function migrateLegacySessions(cutoff: number) {
       const state: SessionState = {
         id: entry.id,
         messageCount: Number.isFinite(entry.messages) ? Math.max(0, Math.floor(entry.messages)) : 0,
-        assistantHash: typeof entry.assistant === "string" ? entry.assistant : null,
-        updatedAt: entry.updated,
-        systemBaseline: null,
-        systemLastHash: null
+        updatedAt: entry.updated
       }
       sessions.set(entry.key, state)
       if (writeSessionFile(entry.key, state)) migrated++
@@ -858,14 +775,10 @@ function scheduleSessionExpiry(key: string) {
   state.timer = timer
 }
 
-function deleteSession(key: string, keepGuards = false) {
+function deleteSession(key: string) {
   const state = sessions.get(key)
   if (state?.timer) clearTimeout(state.timer)
   sessions.delete(key)
-  if (!keepGuards) {
-    hashFailures.delete(key)
-    hashSuspended.delete(key)
-  }
   try {
     rmSync(sessionFilePath(key), { force: true })
   } catch {}
@@ -873,7 +786,6 @@ function deleteSession(key: string, keepGuards = false) {
 
 function rememberSession(key: string, state: SessionState) {
   if (!state.id) return
-  if (hashSuspended.has(key)) state.assistantHash = null
   const previous = sessions.get(key)
   if (previous?.timer) clearTimeout(previous.timer)
   sessions.set(key, state)
@@ -887,11 +799,10 @@ function rememberSession(key: string, state: SessionState) {
 }
 
 /**
- * A resume is only safe if the caller's history still contains exactly the assistant turn the CLI
- * transcript holds, and if at least one new user message follows it. Compaction, regenerate/retry,
- * a truncated history or a second writer on the same session all break that invariant; resuming
- * anyway would replay stale history (or duplicate it) and burn tokens. Falling back to a full
- * replay is always correct, just colder.
+ * A resume is only safe if the caller's history still contains the assistant turn the CLI transcript
+ * holds, and if at least one new user message follows it. Compaction, retry or a truncated history
+ * breaks that invariant; resuming anyway would replay stale history (or duplicate it) and burn
+ * tokens. Falling back to a full replay is always correct, just colder.
  */
 interface ResumeDecision {
   resume: string | null
@@ -906,41 +817,22 @@ function resolveSessionForRequest(key: string | null, messages: any[]): ResumeDe
   if (!state) return { resume: null, state: null, resetReason: null }
 
   let reason: string | null = null
-  let actualHash: string | null = null
   if (messages.length <= state.messageCount) {
     reason = "no_new_turn"
   } else if (messages.length <= state.messageCount + 1) {
     reason = "no_new_user_message"
   } else {
     const previous = messages[state.messageCount]
-    if (!previous || previous.role !== "assistant") {
-      reason = "previous_assistant_missing"
-    } else if (state.assistantHash && !hashSuspended.has(key)) {
-      actualHash = assistantFingerprint(previous.content)
-      if (actualHash !== state.assistantHash) {
-        const failures = (hashFailures.get(key) ?? 0) + 1
-        hashFailures.set(key, failures)
-        if (failures >= 2) {
-          hashFailures.delete(key)
-          hashSuspended.add(key)
-          claudeLog("proxy.session.hash_disabled", { key: key.slice(0, 12) })
-        }
-        reason = "previous_assistant_changed"
-      } else {
-        hashFailures.delete(key)
-      }
-    }
+    if (!previous || previous.role !== "assistant") reason = "previous_assistant_missing"
   }
 
   if (reason) {
-    deleteSession(key, true)
+    deleteSession(key)
     claudeLog("proxy.session.reset", {
       key: key.slice(0, 12),
       reason,
       messages: messages.length,
-      expected: state.messageCount + 2,
-      expectedHash: state.assistantHash,
-      actualHash
+      expected: state.messageCount + 2
     })
     return { resume: null, state: null, resetReason: reason }
   }
@@ -1066,7 +958,7 @@ function warmShape(model: string, env: Env, clientTools: any[]): string {
       JSON.stringify([
         model,
         env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ?? null,
-        canonicalToolList(clientTools).map((t) => [t.name, t.description ?? null, canonicalJson(t.input_schema ?? null)])
+        clientTools.map((t) => [t.name, t.description ?? null, t.input_schema ?? null])
       ])
     )
     .digest("hex")
@@ -1187,17 +1079,8 @@ async function* runTurn(
   forceAlias = false,
   callerSession: string | null = null
 ): AsyncGenerator<StreamEvent> {
-  const requestedTools: any[] =
-    Array.isArray(body.tools) && body.tool_choice?.type !== "none" ? body.tools.filter((t: any) => t?.name) : []
-  // A forced tool call only needs that tool's schema, but dropping the others also rewrites the
-  // cached tool prefix (and again when the full set returns). Off by default; opt in when forced
-  // tool calls are frequent enough that the smaller prefix wins.
-  const forcedTool =
-    body.tool_choice?.type === "tool" && typeof body.tool_choice.name === "string" ? body.tool_choice.name : null
   const clientTools: any[] =
-    FILTER_FORCED_TOOL && forcedTool && requestedTools.some((t: any) => t.name === forcedTool)
-      ? requestedTools.filter((t: any) => t.name === forcedTool)
-      : requestedTools
+    Array.isArray(body.tools) && body.tool_choice?.type !== "none" ? body.tools.filter((t: any) => t?.name) : []
 
   const env = buildCliEnv()
   if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
@@ -1209,44 +1092,40 @@ async function* runTurn(
 
   const messages = Array.isArray(body.messages) ? body.messages : []
   const system = systemText(body.system)
-  const decision = resolveSessionForRequest(callerSession, messages)
+  // Title generation and similar helpers carry the same caller session header but have no tools and
+  // a single message. They must not create or overwrite the real conversation's transcript state.
+  const helperRequest = clientTools.length === 0 && messages.length <= 1
+  const track = callerSession !== null && !helperRequest
+  const effectiveSession = track ? callerSession : null
+  if (effectiveSession) {
+    const pending = pendingTurns.get(effectiveSession)
+    if (pending) {
+      const started = Date.now()
+      await Promise.race([pending, new Promise<void>((resolve) => setTimeout(resolve, PENDING_TURN_TIMEOUT_MS))])
+      claudeLog("proxy.session.waited", { key: effectiveSession.slice(0, 12), ms: Date.now() - started })
+    }
+  }
+  const decision = resolveSessionForRequest(effectiveSession, messages)
   const resume = decision.resume
   // A known conversation resumes its own transcript, which is what keeps tokens flat as it grows.
   const useResume = resume !== null
   const reset = decision.resetReason !== null
 
-  // Claude Code keeps the system prompt a resumed conversation started with. Do the same: a changed
-  // caller prompt is delivered as a conversation message instead of rewriting the cached system
-  // block (and every tool definition before it).
-  let baselineSystem = system
-  let systemUpdate = ""
-  const systemHash = createHash("sha1").update(system).digest("hex")
-  if (FREEZE_SYSTEM_PROMPT && useResume && decision.state && decision.state.systemBaseline !== null) {
-    baselineSystem = decision.state.systemBaseline
-    if (decision.state.systemLastHash && decision.state.systemLastHash !== systemHash) {
-      systemUpdate = systemUpdateBlock(system)
-      claudeLog("proxy.system.updated", { chars: system.length })
-    }
-  }
-
   // The pool is keyed by conversation, so a resuming turn can use a warm process too: that process
   // already sits on the same transcript. Only aliased retries skip it, since they change the shape.
   // A reset conversation must not reuse a process that resumes the transcript we just rejected.
   const shape = warmShape(model, env, clientTools)
-  const key = callerSession ? warmKey(shape, callerSession) : ""
+  const key = effectiveSession ? warmKey(shape, effectiveSession) : ""
   if (reset && key) discardWarmKey(key)
-  const usePool = WARM_POOL_SIZE > 0 && !forceAlias && callerSession !== null && !reset
+  const usePool = WARM_POOL_SIZE > 0 && !forceAlias && effectiveSession !== null && !reset
 
   const warm = usePool ? takeWarm(key, messages.length) : null
   const client = warm ? warm.client : clientTools.length > 0 ? buildClientTools(clientTools) : null
 
   const nameToAlias = client?.nameToAlias ?? new Map<string, string>()
-  // Sessions only exist when the CLI keeps a transcript, so tracking them implies persistence.
-  const track = callerSession !== null
   // On a resume the transcript already holds the history, so only the new turn is sent. Otherwise
   // the whole conversation goes in: it becomes the transcript the next turn resumes from.
-  const tail = useResume ? buildSessionPrompt(messages, nameToAlias) : buildPrompt(messages, nameToAlias)
-  const prompt = systemUpdate ? `${systemUpdate}\n\n${tail}` : tail
+  const prompt = useResume ? buildSessionPrompt(messages, nameToAlias) : buildPrompt(messages, nameToAlias)
   // The warm replacement is a bet, not a computation: it cannot know how many blocks the reply will
   // have, so it expects the caller to come back carrying this turn's user message plus the reply.
   const expectedNextMessageCount = messages.length + 2
@@ -1258,8 +1137,7 @@ async function* runTurn(
     messages: body.messages?.length,
     tools: client?.allowed.length ?? 0,
     warm: usePool ? (warm ? "hit" : "miss") : "off",
-    session: callerSession ? (useResume ? "resume" : reset ? `reset:${decision.resetReason}` : "new") : "off",
-    system: systemUpdate ? "updated" : useResume ? "frozen" : "current"
+    session: effectiveSession ? (useResume ? "resume" : reset ? `reset:${decision.resetReason}` : "new") : "off"
   })
 
   let response: Query
@@ -1271,11 +1149,21 @@ async function* runTurn(
     warm.send(prompt)
     response = warm.query
   } else {
-    const options = buildOptions(model, env, client, abort, track, baselineSystem) as any
+    const options = buildOptions(model, env, client, abort, track, system) as any
     if (useResume) {
       options.resume = resume
     }
     response = query({ prompt, options })
+  }
+  let releasePending: (() => void) | null = null
+  if (effectiveSession) {
+    let release!: () => void
+    const done = new Promise<void>((resolve) => (release = resolve))
+    pendingTurns.set(effectiveSession, done)
+    releasePending = () => {
+      if (pendingTurns.get(effectiveSession!) === done) pendingTurns.delete(effectiveSession!)
+      release()
+    }
   }
   // Start the replacement after this request's own CLI, so it never competes with it for CPU on a miss.
   // It resumes the same conversation, so the next turn lands on a live transcript instead of a blank one.
@@ -1288,49 +1176,6 @@ async function* runTurn(
   let done = false
   let completed = false
   let result: string | null = null
-
-  // Canonical copy of what we streamed, so the next request can prove the caller's history still
-  // matches this transcript before resuming it.
-  const assistantBlocks: Record<number, any> = {}
-  const trackEvent = (event: StreamEvent) => {
-    switch (event.type) {
-      case "content_block_start": {
-        const block = event.content_block
-        if (block?.type === "text") assistantBlocks[event.index] = { type: "text", text: "" }
-        else if (block?.type === "tool_use") {
-          assistantBlocks[event.index] = { type: "tool_use", id: block.id, name: block.name, inputJson: "" }
-        } else delete assistantBlocks[event.index]
-        break
-      }
-      case "content_block_delta": {
-        const block = assistantBlocks[event.index]
-        if (!block) break
-        if (event.delta?.type === "text_delta") block.text += event.delta.text ?? ""
-        else if (event.delta?.type === "input_json_delta") block.inputJson += event.delta.partial_json ?? ""
-        break
-      }
-      case "content_block_stop": {
-        const block = assistantBlocks[event.index]
-        if (block?.type === "tool_use") {
-          try {
-            block.input = block.inputJson ? JSON.parse(block.inputJson) : {}
-          } catch {
-            block.input = {}
-          }
-          delete block.inputJson
-        }
-        break
-      }
-      case "message_stop":
-        completed = true
-        break
-    }
-  }
-  const assistantContent = () =>
-    Object.keys(assistantBlocks)
-      .sort((a, b) => Number(a) - Number(b))
-      .map((index) => assistantBlocks[Number(index)])
-      .filter(Boolean)
 
   try {
     for await (const message of response) {
@@ -1374,9 +1219,9 @@ async function* runTurn(
           event = { ...event, usage: { output_tokens: 0, ...(event.usage ?? {}) } }
         }
 
-        trackEvent(event)
         yield event
         if (event.type === "message_stop") {
+          completed = true
           // Stop emitting, but keep draining the CLI: only its `result` carries the session id and
           // only after that does it flush the transcript we need for the next turn.
           done = true
@@ -1395,9 +1240,9 @@ async function* runTurn(
         // Otherwise replay the full message (e.g. other synthetic CLI messages).
         started = true
         for (const ev of eventsFromAssistantMessage(message.message, client)) {
-          trackEvent(ev)
           yield ev
         }
+        completed = true
         done = true
       }
     }
@@ -1414,24 +1259,22 @@ async function* runTurn(
     const id = result
     if (track && id && completed) {
       claudeLog("proxy.session.remember", { sid: id.slice(0, 8), messages: messages.length })
-      rememberSession(callerSession!, {
+      rememberSession(effectiveSession!, {
         id,
         messageCount: messages.length,
-        assistantHash: assistantFingerprint(assistantContent()),
-        updatedAt: Date.now(),
-        systemBaseline: baselineSystem,
-        systemLastHash: systemHash
+        updatedAt: Date.now()
       })
       // Spawn the replacement only now, holding the id this turn actually produced. Scheduling it
       // before the turn ran always resumed the previous id, so the pool forked the conversation.
       if (usePool) {
-        topUpWarm(key, model, env, clientTools, baselineSystem, id, expectedNextMessageCount)
+        topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount)
       }
     } else if (track && !id) {
       // No session id means there is nothing to resume; a later turn must replay the history.
-      deleteSession(callerSession!)
+      deleteSession(effectiveSession!)
     }
     abort.abort()
+    releasePending?.()
   }
 }
 
@@ -1600,6 +1443,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         },
         cancel() {
           abort.abort()
+          void events.return?.(undefined)
         }
       })
 
