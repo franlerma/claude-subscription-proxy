@@ -24,8 +24,8 @@ const SUMMARIZE_INSTRUCTION = [
 ].join(" ")
 
 // The whole cold history is far too expensive to summarise (and the main model far too expensive to
-// feed it to). Instead send haiku only the recent tail plus read access to the project, and let it
-// re-read the code for the deep context. Keep the tail tiny: the last ~8 messages, capped at ~12k
+// feed it to). Instead send haiku only the recent tail. The main model re-reads the code on its
+// next turn. Keep the tail tiny: the last ~8 messages, capped at ~12k
 // chars (~3k tokens), which is enough for the current intent and the immediate tool results.
 const SUMMARIZE_TAIL_MESSAGES = 8
 const SUMMARIZE_TAIL_CHARS = 12_000
@@ -165,14 +165,15 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
     `[claude-subscription-proxy] haiku summary: starting, ${messages.length} messages total, recent ${inChars} chars`
   )
 
-  const entry = warmSummarizer ?? spawnSummarizer(env)
-  warmSummarizer = null
-  if (warmSummarizerTimer) {
-    clearTimeout(warmSummarizerTimer)
-    warmSummarizerTimer = null
-  }
-
+  let entry: Summarizer | null = null
   try {
+    entry = warmSummarizer ?? spawnSummarizer(env)
+    warmSummarizer = null
+    if (warmSummarizerTimer) {
+      clearTimeout(warmSummarizerTimer)
+      warmSummarizerTimer = null
+    }
+
     const summary = await runSummarizer(entry, tail)
     if (!summary) throw new Error("haiku summary returned no text")
     const ratio = inChars > 0 ? Math.round((1 - summary.length / inChars) * 100) : 0
@@ -191,7 +192,7 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
     // A failed summary means the account is spent or unreachable; the main call shares that fate, so
     // abort the turn instead of replaying the full history against the same wall. Always surface the
     // CLI's own stderr: the exit code alone hides the real reason (429, etc.).
-    const stderr = entry.stderr.join("").trim()
+    const stderr = entry?.stderr.join("").trim() ?? ""
     if (stderr) console.error(`[claude-subscription-proxy] haiku CLI stderr:\n${stderr.slice(0, 1500)}`)
     if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
       const rl = upstreamError(429, stderr.slice(0, 1000))
@@ -203,7 +204,7 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
     claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
     throw error
   } finally {
-    discardSummarizer(entry)
+    if (entry) discardSummarizer(entry)
     ensureWarmSummarizer(env)
   }
 }

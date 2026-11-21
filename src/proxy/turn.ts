@@ -341,11 +341,13 @@ async function* runTurn(
       if (usePool && result !== null) {
         topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
       }
-    } else if (track && !completed && started) {
-      // The turn began emitting but never finished: the transcript may hold a partial turn, so
-      // drop the mapping and let a later turn replay the history. A failure before the first token
-      // (a 429, a CLI that never started) leaves the previous transcript intact - keep it, both
-      // because it is still valid and because dropping it turns the next turn into a cold replay.
+    } else if (track && started) {
+      // The turn emitted output but did not yield a session id to remember: either it never
+      // finished, or it was a compacted turn whose new transcript is unknown. The mapping would
+      // otherwise keep pointing at the pre-compaction transcript, so drop it and let a later turn
+      // replay the history. A failure before the first token (a 429, a CLI that never started)
+      // leaves the previous transcript intact - keep it, both because it is still valid and because
+      // dropping it turns the next turn into a cold replay.
       deleteSession(effectiveSession!)
     }
     abort.abort()
