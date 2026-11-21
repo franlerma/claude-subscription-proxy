@@ -79,23 +79,26 @@ export function callerSystemBlock(system: string): string {
   return ["<caller_system_prompt>", system, CWD_HINT, "</caller_system_prompt>"].join("\n")
 }
 
-export function buildPrompt(messages: any[], nameToAlias: Map<string, string>): string {
-  const body =
-    messages.length === 1 && messages[0]?.role === "user"
-      ? renderBlocks(messages[0].content, nameToAlias)
-      : [
-          "Conversation history. Write the next assistant turn. Call tools normally; never type <tool_call>/<tool_result>.",
-          "<conversation>",
-          messages
-            .map((m) => {
-              const role = m?.role === "assistant" ? "assistant" : "user"
-              return `<${role}>\n${renderBlocks(m?.content, nameToAlias)}\n</${role}>`
-            })
-            .join("\n"),
-          "</conversation>"
-        ].join("\n")
+/** Wraps each message in its role tag, the format the CLI reads as conversation history. */
+function renderMessages(messages: any[], nameToAlias: Map<string, string>): string {
+  return messages
+    .map((m) => {
+      const role = m?.role === "assistant" ? "assistant" : "user"
+      return `<${role}>\n${renderBlocks(m?.content, nameToAlias)}\n</${role}>`
+    })
+    .join("\n")
+}
 
-  return body
+export function buildPrompt(messages: any[], nameToAlias: Map<string, string>): string {
+  if (messages.length === 1 && messages[0]?.role === "user") {
+    return renderBlocks(messages[0].content, nameToAlias)
+  }
+  return [
+    "Conversation history. Write the next assistant turn. Call tools normally; never type <tool_call>/<tool_result>.",
+    "<conversation>",
+    renderMessages(messages, nameToAlias),
+    "</conversation>"
+  ].join("\n")
 }
 
 /**
@@ -122,26 +125,15 @@ export function buildSessionPrompt(messages: any[], nameToAlias: Map<string, str
   if (fresh.length === 1 && fresh[0]?.role === "user") {
     return renderBlocks(fresh[0].content, nameToAlias)
   }
-  return fresh
-    .map((m) => {
-      const role = m?.role === "assistant" ? "assistant" : "user"
-      return `<${role}>\n${renderBlocks(m?.content, nameToAlias)}\n</${role}>`
-    })
-    .join("\n")
+  return renderMessages(fresh, nameToAlias)
 }
 
 export function buildCompactedPrompt(summary: string, tail: any[], nameToAlias: Map<string, string>): string {
-  const tailBody = tail
-    .map((m) => {
-      const role = m?.role === "assistant" ? "assistant" : "user"
-      return `<${role}>\n${renderBlocks(m?.content, nameToAlias)}\n</${role}>`
-    })
-    .join("\n")
   return [
     "Conversation history. Write the next assistant turn. Call tools normally; never type <tool_call>/<tool_result>.",
     "<conversation>",
     `<user>\n<history_summary>\n${summary}\n</history_summary>\n</user>`,
-    tailBody,
+    renderMessages(tail, nameToAlias),
     "</conversation>"
   ].join("\n")
 }

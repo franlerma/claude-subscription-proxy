@@ -78,11 +78,6 @@ export interface ClientTools {
   aliasToName: Map<string, string>
 }
 
-/**
- * Dedupe by name, then sort by code point. The tool list is the first part of the API request:
- * reordering it invalidates the entire prompt cache even though the definitions are unchanged.
- */
-
 // Compiling a JSON schema into zod is the expensive part of building the client tools, and it runs
 // twice per turn (the turn's own CLI and its warm replacement). Cache per schema so the same tool
 // set only pays it once. Only the derived shape is shared - a fresh MCP server is built per call.
@@ -99,6 +94,10 @@ function cachedShape(schema: any): Record<string, z.ZodTypeAny> {
   return shape
 }
 
+/**
+ * Dedupe by name, then sort by code point. The tool list is the first part of the API request:
+ * reordering it invalidates the entire prompt cache even though the definitions are unchanged.
+ */
 export function buildClientTools(tools: Array<{ name: string; description?: string; input_schema?: any }>): ClientTools {
   const nameToAlias = new Map<string, string>()
   const aliasToName = new Map<string, string>()
