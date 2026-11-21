@@ -1194,6 +1194,7 @@ function chunkMessages(messages: any[]): string[] {
 interface Summarizer {
   query: Query
   abort: AbortController
+  /** Queues the next prompt for the running multi-turn process. */
   send: (prompt: string) => void
   /** Accumulates the CLI's stderr so failures surface the real reason, not just the exit code. */
   stderr: string[]
@@ -1201,16 +1202,26 @@ interface Summarizer {
 
 let warmSummarizer: Summarizer | null = null
 
+// One haiku process folds every chunk into a running summary. This reuses the CLI start-up and the
+// cached `claude_code` prefix across chunks, instead of paying both once per chunk. The queue lets the
+// consumer feed the next chunk only after the previous one's reply, so the running summary is known.
 function spawnSummarizer(env: Env): Summarizer {
   const abort = new AbortController()
   const stderr: string[] = []
-  let release!: (prompt: string) => void
-  const gate = new Promise<string>((resolve) => (release = resolve))
+  const queue: string[] = []
+  let wake: (() => void) | null = null
+
   async function* input(): AsyncGenerator<SDKUserMessage> {
-    const prompt = await gate
-    if (!prompt) return
-    yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" }
+    while (true) {
+      while (queue.length === 0) {
+        await new Promise<void>((resolve) => (wake = resolve))
+      }
+      const prompt = queue.shift()
+      if (!prompt) return
+      yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" }
+    }
   }
+
   const options: Record<string, any> = {
     model: "haiku",
     pathToClaudeCodeExecutable: claudeExecutable,
@@ -1221,7 +1232,8 @@ function spawnSummarizer(env: Env): Summarizer {
     },
     tools: [],
     settingSources: [],
-    maxTurns: 1,
+    // No maxTurns cap: the queue drives the loop, one user message per chunk. A sentinel empty prompt
+    // in discardSummarizer ends the stream.
     includePartialMessages: false,
     persistSession: false,
     abortController: abort,
@@ -1229,7 +1241,16 @@ function spawnSummarizer(env: Env): Summarizer {
     stderr: (data: string) => stderr.push(data)
   }
   const q = query({ prompt: input(), options })
-  return { query: q, abort, send: release, stderr }
+  return {
+    query: q,
+    abort,
+    send: (prompt: string) => {
+      queue.push(prompt)
+      wake?.()
+      wake = null
+    },
+    stderr
+  }
 }
 
 function discardSummarizer(entry: Summarizer) {
@@ -1240,7 +1261,7 @@ function discardSummarizer(entry: Summarizer) {
     entry.abort.abort()
   } catch {}
   try {
-    entry.send("")
+    entry.send("") // sentinel: ends the input stream and lets the CLI finish
   } catch {}
 }
 
@@ -1256,6 +1277,9 @@ function ensureWarmSummarizer(env: Env) {
 async function runSummarizer(entry: Summarizer, prompt: string): Promise<string> {
   entry.send(prompt)
   let text = ""
+  // Read exactly one turn: with a persistent multi-turn process the stream does not end after one
+  // assistant message, so a for-await would hang waiting for the next chunk. A turn ends with its
+  // `result` message.
   for await (const message of entry.query) {
     if (message.type === "assistant") {
       const blocks: any[] = Array.isArray((message as any).message?.content) ? (message as any).message.content : []
@@ -1267,29 +1291,11 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
       if (/hit your limit|resets \d|5.?hour|usage limit|rate.?limit|too many requests/i.test(text)) {
         throw upstreamError(429, text.trim())
       }
+    } else if (message.type === "result") {
+      break
     }
   }
   return text.trim()
-}
-
-/** Runs one summarizer process to completion and returns its text (empty on failure). */
-async function runOneSummary(env: Env, prompt: string): Promise<string> {
-  const entry = warmSummarizer ?? spawnSummarizer(env)
-  warmSummarizer = null
-  try {
-    return await runSummarizer(entry, prompt)
-  } catch (error) {
-    // Always surface the CLI's own stderr: the exit code alone hides the real reason (429, etc.).
-    const stderr = entry.stderr.join("").trim()
-    if (stderr) console.error(`[claude-subscription-proxy] haiku CLI stderr:\n${stderr.slice(0, 1500)}`)
-    if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
-      throw upstreamError(429, stderr.slice(0, 1000))
-    }
-    throw error
-  } finally {
-    discardSummarizer(entry)
-    ensureWarmSummarizer(env)
-  }
 }
 
 /**
@@ -1308,11 +1314,16 @@ async function summarizeHistory(messages: any[]): Promise<string> {
     `[claude-subscription-proxy] haiku summary: starting, ${messages.length} messages in ${chunks.length} chunk(s), ${inChars} chars`
   )
 
+  // One warm process folds every chunk into a running summary, so the CLI start-up and the cached
+  // prefix are paid once for the whole history, not once per chunk.
+  const entry = warmSummarizer ?? spawnSummarizer(env)
+  warmSummarizer = null
+
   let summary = ""
   try {
     for (const chunk of chunks) {
       const prompt = summary ? `${summary}\n\n---\n\n${chunk}` : chunk
-      const next = await runOneSummary(env, prompt)
+      const next = await runSummarizer(entry, prompt)
       if (!next) throw new Error("haiku summary returned no text")
       summary = next
     }
@@ -1331,10 +1342,22 @@ async function summarizeHistory(messages: any[]): Promise<string> {
     return summary
   } catch (error) {
     // A failed summary means the account is spent or unreachable; the main call shares that fate, so
-    // abort the turn instead of replaying the full history against the same wall.
+    // abort the turn instead of replaying the full history against the same wall. Always surface the
+    // CLI's own stderr: the exit code alone hides the real reason (429, etc.).
+    const stderr = entry.stderr.join("").trim()
+    if (stderr) console.error(`[claude-subscription-proxy] haiku CLI stderr:\n${stderr.slice(0, 1500)}`)
+    if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
+      const rl = upstreamError(429, stderr.slice(0, 1000))
+      console.error("[claude-subscription-proxy] haiku summary failed:", rl.message)
+      claudeLog("proxy.haiku.summarize_failed", { error: rl.message })
+      throw rl
+    }
     console.error("[claude-subscription-proxy] haiku summary failed:", error instanceof Error ? error.message : String(error))
     claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
     throw error
+  } finally {
+    discardSummarizer(entry)
+    ensureWarmSummarizer(env)
   }
 }
 
