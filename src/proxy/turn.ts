@@ -107,7 +107,7 @@ function persistTurn(o: TurnOutcome) {
   const id = o.result ?? (o.completed ? o.resumedId : null)
   if (o.session && id) {
     claudeLog("proxy.session.remember", {
-      sid: id,
+      claudeSessionId: id,
       messages: o.messageCount,
       completed: o.completed,
       viaResult: o.result !== null
@@ -207,7 +207,7 @@ async function* runTurn(
   const expectedNextMessageCount = messages.length + 2
 
   claudeLog("proxy.anthropic.request", {
-    sid: effectiveSession ?? "none",
+    sessionId: effectiveSession ?? "none",
     model,
     requested: body.model,
     stream: body.stream === true,
