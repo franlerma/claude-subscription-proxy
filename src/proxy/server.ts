@@ -1225,7 +1225,10 @@ function spawnSummarizer(env: Env): Summarizer {
     allowedTools: ["Read", "Glob", "Grep"],
     disallowedTools: ["Bash", "Edit", "Write", "WebFetch", "WebSearch", "Task", "TodoWrite"],
     settingSources: [],
-    maxTurns: 1,
+    // Room for a few tool_use rounds (read files) before the final summary text. With maxTurns: 1 the
+    // summarizer would stop at the first Read and return no text. The single input message still ends
+    // the stream, so this only bounds how many Read/Glob rounds the agent may take.
+    maxTurns: 5,
     includePartialMessages: false,
     persistSession: false,
     abortController: abort,
