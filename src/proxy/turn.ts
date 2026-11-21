@@ -154,7 +154,9 @@ async function* runTurn(
     const pending = pendingTurns.get(effectiveSession)
     if (pending) {
       const started = Date.now()
-      await Promise.race([pending, new Promise<void>((resolve) => setTimeout(resolve, PENDING_TURN_TIMEOUT_MS))])
+      let timer!: ReturnType<typeof setTimeout>
+      await Promise.race([pending, new Promise<void>((resolve) => (timer = setTimeout(resolve, PENDING_TURN_TIMEOUT_MS)))])
+      clearTimeout(timer)
       claudeLog("proxy.session.waited", { key: effectiveSession.slice(0, 12), ms: Date.now() - started })
     }
   }

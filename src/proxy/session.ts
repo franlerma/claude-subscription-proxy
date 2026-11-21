@@ -265,10 +265,6 @@ function loadSessions() {
   if (sessions.size > 0) claudeLog("proxy.session.loaded", { count: sessions.size })
 }
 
-function ensureSessionsLoaded() {
-  loadSessions()
-}
-
 function scheduleSessionExpiry(key: string) {
   const state = sessions.get(key)
   if (!state) return
@@ -325,7 +321,7 @@ interface ResumeDecision {
 
 export function resolveSessionForRequest(key: string | null, messages: any[]): ResumeDecision {
   if (!key || !SESSION_MODE) return { resume: null, state: null, resetReason: null }
-  ensureSessionsLoaded()
+  loadSessions()
   const state = sessions.get(key) ?? null
   if (!state) return { resume: null, state: null, resetReason: null }
 
@@ -435,7 +431,7 @@ export function startSessionSweeper() {
       symlinkSync(source, own)
     } catch {}
   }
-  ensureSessionsLoaded()
+  loadSessions()
   const interval = setInterval(sweepSessions, Math.min(SESSION_TTL_MS, 300_000))
   interval.unref?.()
   sweepSessions()
