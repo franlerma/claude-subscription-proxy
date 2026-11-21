@@ -3,7 +3,7 @@ import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
 import { claudeExecutable } from "./models"
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY, renderBlocks } from "./prompt"
-import { buildCliEnv, type Env, SESSION_MODE, SESSION_CONFIG_DIR } from "./env"
+import { buildCliEnv, type Env, SESSION_MODE, SESSION_CONFIG_DIR, WARM_POOL_TTL_MS } from "./env"
 import { upstreamError } from "./errors"
 
 // ---------------------------------------------------------------------------------------
@@ -55,10 +55,10 @@ interface Summarizer {
 }
 
 let warmSummarizer: Summarizer | null = null
+let warmSummarizerTimer: ReturnType<typeof setTimeout> | null = null
 
-// One haiku process per summary. It gets the recent history tail plus read access to the project, and
-// re-reads the code for the deep context instead of receiving the whole cold history. Kept warm so
-// the CLI start-up is paid once, not per summary.
+// One haiku process per summary. It gets only the recent history tail - no project access - and
+// interpolates a short summary from it. Kept warm so the CLI start-up is paid once, not per summary.
 function spawnSummarizer(env: Env): Summarizer {
   const abort = new AbortController()
   const stderr: string[] = []
@@ -109,6 +109,16 @@ function ensureWarmSummarizer(env: Env) {
   if (warmSummarizer) return
   try {
     warmSummarizer = spawnSummarizer(env)
+    // Without a TTL the idle haiku CLI lived for the whole proxy lifetime, holding a process (and
+    // its cached prefix) for a compaction that may never come.
+    if (warmSummarizerTimer) clearTimeout(warmSummarizerTimer)
+    warmSummarizerTimer = setTimeout(() => {
+      const entry = warmSummarizer
+      warmSummarizer = null
+      warmSummarizerTimer = null
+      if (entry) discardSummarizer(entry)
+    }, WARM_POOL_TTL_MS)
+    warmSummarizerTimer.unref?.()
   } catch (error) {
     claudeLog("proxy.haiku.warm_failed", { error: error instanceof Error ? error.message : String(error) })
   }
@@ -140,8 +150,8 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
 }
 
 /**
- * Produces a compact context summary with haiku: it receives the recent history tail plus read access
- * to the project and re-reads the code for the deep context, instead of the whole cold history.
+ * Produces a compact context summary with haiku from the recent history tail only, instead of the
+ * whole cold history.
  * Throws on failure: the summary and the turn share the same subscription and endpoint, so a failed
  * summary means the main call would fail too, and replaying the full history would only burn more.
  */
@@ -157,6 +167,10 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
 
   const entry = warmSummarizer ?? spawnSummarizer(env)
   warmSummarizer = null
+  if (warmSummarizerTimer) {
+    clearTimeout(warmSummarizerTimer)
+    warmSummarizerTimer = null
+  }
 
   try {
     const summary = await runSummarizer(entry, tail)

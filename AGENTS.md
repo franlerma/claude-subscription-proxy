@@ -27,7 +27,7 @@ Hard-won lessons about the Claude Agent SDK and this proxy, so future iterations
 ## The summarizer (haiku)
 
 - **Never summarise the whole cold history.** A model-switch request can carry ~1M chars (~250k tokens) of prior conversation. Summarising all of it was infeasible in time (and multi-chunk was 8 CLI start-ups + 8 cold cache writes), and feeding it to the turn model is the expensive line: ~$0.70-1.10/turn on Sonnet. The haiku summary itself is ~$0.01.
-- Instead send haiku **only the recent tail** (~8 messages, ~12k chars / ~3k tokens) **plus read access to the project**, and let it re-read the code (`Read`/`Glob`/`Grep` via `allowedTools`) for the deep context. The tail must cover the current intent and the immediate tool results, nothing older — the code is the source of truth for the rest.
+- Instead send haiku **only the recent tail** (~8 messages, ~12k chars / ~3k tokens) and nothing else. Exploring the project (`Read`/`Glob`/`Grep`) was tried and removed: it was slow and made the summary unpredictable. The main model does its own reading on the next turn. The tail must cover the current intent and the immediate tool results, nothing older.
 - One warm haiku process (`maxTurns: 1`) is kept waiting so the CLI start-up and the cached `claude_code` prefix are paid once, not per summary. `persistSession: false` keeps it out of the session store.
 - A single turn can emit several assistant messages (one with `thinking` content, then the final text). Read the summary from `content` blocks filtered by `type === "text"` and keep the last non-empty text.
 

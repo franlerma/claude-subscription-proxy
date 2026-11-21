@@ -31,12 +31,13 @@ export interface WarmEntry {
  */
 const warmPool = new Map<string, WarmEntry>()
 
-export function warmShape(model: string, env: Env, clientTools: any[]): string {
+export function warmShape(model: string, env: Env, clientTools: any[], maxThinkingTokens?: number): string {
   return createHash("sha1")
     .update(
       JSON.stringify([
         model,
         env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ?? null,
+        maxThinkingTokens ?? null,
         clientTools.map((t) => [t.name, t.description ?? null, t.input_schema ?? null])
       ])
     )
@@ -77,7 +78,8 @@ function spawnWarm(
   clientTools: any[],
   callerSystem: string,
   resume: string | null,
-  expectedMessageCount: number | null = null
+  expectedMessageCount: number | null = null,
+  maxThinkingTokens?: number
 ): WarmEntry {
   const abort = new AbortController()
   const client = clientTools.length > 0 ? buildClientTools(clientTools) : null
@@ -93,7 +95,7 @@ function spawnWarm(
 
   // A warm process resumes the conversation's transcript when it has one. Without this the pool
   // serves blank processes, which defeat prompt caching entirely.
-  const options = buildOptions(model, env, client, abort, resume !== null, callerSystem, stderr) as any
+  const options = buildOptions(model, env, client, abort, resume !== null, callerSystem, stderr, maxThinkingTokens) as any
   if (resume) options.resume = resume
   const q = query({ prompt: input(), options })
   const entry: WarmEntry = {
@@ -145,7 +147,8 @@ export function topUpWarm(
   clientTools: any[],
   callerSystem: string,
   resume: string | null,
-  expectedMessageCount: number | null = null
+  expectedMessageCount: number | null = null,
+  maxThinkingTokens?: number
 ) {
   if (warmPool.has(key)) return
   while (warmPool.size >= WARM_POOL_SIZE) {
@@ -154,7 +157,10 @@ export function topUpWarm(
     warmPool.delete(oldest)
   }
   try {
-    warmPool.set(key, spawnWarm(key, model, env, clientTools, callerSystem, resume, expectedMessageCount))
+    warmPool.set(
+      key,
+      spawnWarm(key, model, env, clientTools, callerSystem, resume, expectedMessageCount, maxThinkingTokens)
+    )
   } catch (error) {
     claudeLog("proxy.warm.spawn_failed", { error: error instanceof Error ? error.message : String(error) })
   }

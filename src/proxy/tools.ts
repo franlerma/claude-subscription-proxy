@@ -82,29 +82,54 @@ export interface ClientTools {
  * Dedupe by name, then sort by code point. The tool list is the first part of the API request:
  * reordering it invalidates the entire prompt cache even though the definitions are unchanged.
  */
+
+// Compiling a JSON schema into zod is the expensive part of building the client tools, and it runs
+// twice per turn (the turn's own CLI and its warm replacement). Cache per schema so the same tool
+// set only pays it once. Only the derived shape is shared - a fresh MCP server is built per call.
+const toolShapeCache = new Map<string, Record<string, z.ZodTypeAny>>()
+
+function cachedShape(schema: any): Record<string, z.ZodTypeAny> {
+  if (!schema || typeof schema !== "object") return {}
+  const key = JSON.stringify(schema)
+  const hit = toolShapeCache.get(key)
+  if (hit) return hit
+  const shape = schemaToShape(schema)
+  if (toolShapeCache.size >= 256) toolShapeCache.clear()
+  toolShapeCache.set(key, shape)
+  return shape
+}
+
 export function buildClientTools(tools: Array<{ name: string; description?: string; input_schema?: any }>): ClientTools {
   const nameToAlias = new Map<string, string>()
   const aliasToName = new Map<string, string>()
   const maxLen = 64 - CLIENT_TOOL_PREFIX.length
 
-  const sdkTools = tools
-    .filter((t) => t && typeof t.name === "string" && t.name)
-    .map((t, i) => {
-      let alias = t.name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, maxLen)
-      if (aliasToName.has(alias)) alias = `${alias.slice(0, maxLen - 4)}_${i}`
-      nameToAlias.set(t.name, alias)
-      aliasToName.set(alias, t.name)
-      return tool(
-        alias,
-        t.description || t.name,
-        schemaToShape(t.input_schema) as any,
-        // Never meant to run: the turn is aborted as soon as the model emits the tool_use.
-        async () => ({
-          content: [{ type: "text" as const, text: "This tool is executed by the client, not by the proxy." }],
-          isError: true
-        })
-      )
-    })
+  // Tools are the first part of the API request. Reordering them - or a duplicate slipping in -
+  // invalidates the whole prompt cache even when the definitions are unchanged, so dedupe by name
+  // (first wins) and sort by code point before anything is turned into an MCP tool.
+  const unique = new Map<string, { name: string; description?: string; input_schema?: any }>()
+  for (const t of tools) {
+    if (!t || typeof t.name !== "string" || !t.name) continue
+    if (!unique.has(t.name)) unique.set(t.name, t)
+  }
+  const ordered = [...unique.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+
+  const sdkTools = ordered.map((t, i) => {
+    let alias = t.name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, maxLen)
+    if (aliasToName.has(alias)) alias = `${alias.slice(0, maxLen - 4)}_${i}`
+    nameToAlias.set(t.name, alias)
+    aliasToName.set(alias, t.name)
+    return tool(
+      alias,
+      t.description || t.name,
+      cachedShape(t.input_schema) as any,
+      // Never meant to run: the turn is aborted as soon as the model emits the tool_use.
+      async () => ({
+        content: [{ type: "text" as const, text: "This tool is executed by the client, not by the proxy." }],
+        isError: true
+      })
+    )
+  })
 
   const server = createSdkMcpServer({ name: CLIENT_MCP_SERVER, version: "1.0.0", tools: sdkTools })
   return { server, allowed: [...aliasToName.keys()].map((a) => `${CLIENT_TOOL_PREFIX}${a}`), nameToAlias, aliasToName }

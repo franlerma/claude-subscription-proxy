@@ -43,3 +43,20 @@ export function resolveModel(model: unknown, forceAlias = false): string {
   }
   return aliasForModel(name)
 }
+
+/**
+ * Maps the Anthropic `thinking` parameter to the CLI's `maxThinkingTokens`. Returning `undefined`
+ * leaves the CLI's own default untouched; only an explicit `disabled` (0) or `enabled` budget
+ * overrides it. Without this the caller's thinking intent was simply dropped and the CLI's default
+ * budget applied to every turn.
+ */
+export function thinkingBudget(thinking: unknown): number | undefined {
+  if (!thinking || typeof thinking !== "object") return undefined
+  const t = thinking as { type?: unknown; budget_tokens?: unknown }
+  if (t.type === "disabled") return 0
+  if (t.type === "enabled") {
+    const n = Number(t.budget_tokens)
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined
+  }
+  return undefined
+}

@@ -1,9 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import type { Query } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
-import { upstreamError } from "./errors"
+import { ProxyError, upstreamError } from "./errors"
 import type { StreamEvent } from "./errors"
-import { resolveModel, aliasForModel, DEFAULT_MAX_OUTPUT_TOKENS } from "./models"
+import { resolveModel, aliasForModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
 import { buildClientTools, originalToolName, type ClientTools } from "./tools"
 import { systemText, buildPrompt, buildSessionPrompt, buildCompactedPrompt } from "./prompt"
 import {
@@ -15,6 +15,7 @@ import {
   SESSION_FLUSH_MS,
   COMPACT_HISTORY_TOKENS,
   COMPACT_KEEP_MESSAGES,
+  HELPER_MODEL,
   estimateHistoryTokens
 } from "./env"
 import {
@@ -89,13 +90,16 @@ async function* runTurn(
   if (Number.isFinite(maxTokens) && maxTokens > 0) {
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.min(Math.floor(maxTokens), DEFAULT_MAX_OUTPUT_TOKENS))
   }
-  const model = resolveModel(body.model, forceAlias)
 
   const messages = Array.isArray(body.messages) ? body.messages : []
   const system = systemText(body.system)
   // Title generation and similar helpers carry the same caller session header but have no tools and
   // a single message. They must not create or overwrite the real conversation's transcript state.
   const helperRequest = clientTools.length === 0 && messages.length <= 1
+  // Helpers never need the conversation's model: route them to a cheap alias so a title costs a
+  // haiku call instead of a Sonnet/Opus one. The caller's `thinking` budget is forwarded as-is.
+  const model = resolveModel(helperRequest ? HELPER_MODEL : body.model, forceAlias)
+  const maxThinkingTokens = thinkingBudget(body.thinking)
   const track = callerSession !== null && !helperRequest
   const effectiveSession = track ? callerSession : null
   if (effectiveSession) {
@@ -127,7 +131,7 @@ async function* runTurn(
   // The pool is keyed by conversation, so a resuming turn can use a warm process too: that process
   // already sits on the same transcript. Only aliased retries skip it, since they change the shape.
   // A reset conversation must not reuse a process that resumes the transcript we just rejected.
-  const shape = warmShape(model, env, clientTools)
+  const shape = warmShape(model, env, clientTools, maxThinkingTokens)
   const key = effectiveSession ? warmKey(shape, effectiveSession) : ""
   if (reset && key) discardWarmKey(key)
   const usePool = WARM_POOL_SIZE > 0 && !forceAlias && effectiveSession !== null && !reset && !compact
@@ -173,7 +177,7 @@ async function* runTurn(
     warm.send(prompt)
     response = warm.query
   } else {
-    const options = buildOptions(model, env, client, abort, track, system, coldStderr) as any
+    const options = buildOptions(model, env, client, abort, track, system, coldStderr, maxThinkingTokens) as any
     if (useResume) {
       options.resume = resume
     }
@@ -192,6 +196,7 @@ async function* runTurn(
   // Start the replacement after this request's own CLI, so it never competes with it for CPU on a miss.
   // It resumes the same conversation, so the next turn lands on a live transcript instead of a blank one.
   let started = false
+  let usage: Record<string, any> = {}
   // The caller gets its assistant message as soon as `message_stop` arrives, but the CLI only
   // flushes the persisted transcript - and only the `result` carries its real session id - once the
   // turn has finished. Returning early or aborting the process here would leave nothing to resume,
@@ -224,6 +229,7 @@ async function* runTurn(
           }
           started = true
           const u = (event as any).message?.usage ?? {}
+          usage = { ...u }
           claudeLog("proxy.anthropic.usage", {
             input: u.input_tokens ?? null,
             cache_read: u.cache_read_input_tokens ?? null,
@@ -241,6 +247,14 @@ async function* runTurn(
         }
         if (event.type === "message_delta") {
           event = { ...event, usage: { output_tokens: 0, ...(event.usage ?? {}) } }
+          usage = { ...usage, ...(event.usage ?? {}) }
+          // One line per turn, unconditional: cache_read vs cache_creation is the only signal that
+          // tells a healthy cached prefix from a cold replay, and it must be visible in journald.
+          console.log(
+            `[claude-subscription-proxy] usage model=${model} input=${usage.input_tokens ?? 0} ` +
+              `cache_read=${usage.cache_read_input_tokens ?? 0} ` +
+              `cache_creation=${usage.cache_creation_input_tokens ?? 0} output=${usage.output_tokens ?? 0}`
+          )
         }
 
         yield event
@@ -297,12 +311,23 @@ async function* runTurn(
   } finally {
     // Always let the CLI finish writing its transcript and report the session id, even when the
     // caller already got its message. Killing it here is what left nothing to resume from.
-    if (track || result !== null) {
+    // A `result` already proves the transcript was flushed, so only wait when it is still missing.
+    if (result === null && track) {
       await new Promise((resolve) => setTimeout(resolve, SESSION_FLUSH_MS))
     }
-    const id = result
-    if (track && id && completed) {
-      claudeLog("proxy.session.remember", { sid: id.slice(0, 8), messages: messages.length })
+    // A turn that already emitted its message but whose CLI ended without a `result` (the process
+    // was killed, or the stream closed early) still owns the transcript it resumed from. Deleting
+    // the session there is what forced the next turn to replay the whole history cold - the exact
+    // case the cache cannot survive. Keep the id we resumed from instead of throwing it away.
+    const resumedId = warm?.resume ?? resume
+    const id = result ?? (completed ? resumedId : null)
+    if (track && id) {
+      claudeLog("proxy.session.remember", {
+        sid: id.slice(0, 8),
+        messages: messages.length,
+        completed,
+        viaResult: result !== null
+      })
       rememberSession(effectiveSession!, {
         id,
         messageCount: messages.length,
@@ -311,11 +336,16 @@ async function* runTurn(
       })
       // Spawn the replacement only now, holding the id this turn actually produced. Scheduling it
       // before the turn ran always resumed the previous id, so the pool forked the conversation.
-      if (usePool) {
-        topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount)
+      // Only a `result` proves the transcript was flushed; without it a warm process could resume a
+      // half-written transcript, so the pool is left cold for one turn instead.
+      if (usePool && result !== null) {
+        topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
       }
-    } else if (track && !id) {
-      // No session id means there is nothing to resume; a later turn must replay the history.
+    } else if (track && !completed && started) {
+      // The turn began emitting but never finished: the transcript may hold a partial turn, so
+      // drop the mapping and let a later turn replay the history. A failure before the first token
+      // (a 429, a CLI that never started) leaves the previous transcript intact - keep it, both
+      // because it is still valid and because dropping it turns the next turn into a cold replay.
       deleteSession(effectiveSession!)
     }
     abort.abort()
@@ -351,6 +381,11 @@ export async function* runTurnWithFallback(
       return
     }
     if (started || !exact || !/model/i.test(message) || abort.signal.aborted) throw error
+    // A spent plan / overloaded upstream can mention "model" in its text, but retrying with the
+    // alias would just be a second doomed call against the same subscription. Only a genuine
+    // model-id rejection (and never a rate limit) is worth a retry.
+    if (error instanceof ProxyError && error.status === 429) throw error
+    if (/rate.?limit|usage limit|hit your limit|too many requests|overloaded/i.test(message)) throw error
     console.error("[claude-subscription-proxy] exact model rejected, retrying with alias:", body.model, "-", message.slice(0, 200))
   }
   yield* runTurn(body, new AbortController(), true, callerSession)

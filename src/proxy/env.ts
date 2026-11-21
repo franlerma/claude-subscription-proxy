@@ -14,7 +14,8 @@ export function buildOptions(
   abort: AbortController,
   persist = false,
   callerSystem = "",
-  stderrBuf?: string[]
+  stderrBuf?: string[],
+  maxThinkingTokens?: number
 ): Record<string, any> {
   const options: Record<string, any> = {
     model,
@@ -47,6 +48,9 @@ export function buildOptions(
     options.mcpServers = { [CLIENT_MCP_SERVER]: client.server }
     options.allowedTools = client.allowed
   }
+  // The caller's `thinking` budget is forwarded when present. Leaving it undefined keeps the CLI's
+  // own default, which the ambient-environment hardening already protects from MAX_THINKING_TOKENS.
+  if (maxThinkingTokens !== undefined) options.maxThinkingTokens = maxThinkingTokens
   return options
 }
 
@@ -127,6 +131,17 @@ export const COMPACT_HISTORY_TOKENS = (() => {
 })()
 export const COMPACT_KEEP_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_COMPACT_KEEP_MESSAGES", 4))
 
+// ---------------------------------------------------------------------------------------
+// Helper requests
+//
+// Title generation and similar helpers arrive as a single message with no tools. They never need
+// the conversation's expensive model, so they run on a cheap one instead of consuming the main
+// model's subscription quota for one line of text.
+//   CLAUDE_PROXY_HELPER_MODEL  CLI alias or exact id for helper requests (default haiku)
+// ---------------------------------------------------------------------------------------
+
+export const HELPER_MODEL = process.env.CLAUDE_PROXY_HELPER_MODEL?.trim() || "haiku"
+
 /** Rough char/4 token estimate over the whole conversation, for deciding whether to compact. */
 export function estimateHistoryTokens(messages: any[]): number {
   let chars = 0
@@ -164,10 +179,12 @@ const STRIPPED_ENV = [
 
 // Claude Code auto-compacts its transcript when the context fills. The proxy runs one turn per CLI
 // process (`maxTurns: 1`) and aborts it afterwards, so compaction can only happen when the CLI loads
-// a resumed transcript that is already past its threshold. Lowering the threshold here keeps the
-// re-read transcript small instead of letting it grow unbounded (each turn re-reads it from cache).
-//   CLAUDE_PROXY_AUTOCOMPACT_PCT  % of context at which the CLI compacts on resume (default 40)
-const AUTOCOMPACT_PCT = Math.max(1, Math.min(100, envInt("CLAUDE_PROXY_AUTOCOMPACT_PCT", 40)))
+// a resumed transcript that is already past its threshold. Compacting rewrites the transcript and
+// invalidates the cached prefix the next turn would otherwise read, so it must be a last resort, not
+// a routine event: the old 40% default fired while growth was still cheap. Keep a safety margin for
+// the context limit but let a healthy transcript grow.
+//   CLAUDE_PROXY_AUTOCOMPACT_PCT  % of context at which the CLI compacts on resume (default 90)
+const AUTOCOMPACT_PCT = Math.max(1, Math.min(100, envInt("CLAUDE_PROXY_AUTOCOMPACT_PCT", 90)))
 
 export function buildCliEnv(): Env {
   const env: Env = { ...process.env }
