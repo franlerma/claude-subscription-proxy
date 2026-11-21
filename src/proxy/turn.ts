@@ -9,7 +9,6 @@ import { systemText, buildPrompt, buildSessionPrompt, buildCompactedPrompt } fro
 import {
   buildCliEnv,
   buildOptions,
-  type Env,
   WARM_POOL_SIZE,
   SESSION_MODE,
   SESSION_CONFIG_DIR,
