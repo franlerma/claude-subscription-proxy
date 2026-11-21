@@ -207,6 +207,7 @@ async function* runTurn(
   const expectedNextMessageCount = messages.length + 2
 
   claudeLog("proxy.anthropic.request", {
+    sid: effectiveSession ?? "none",
     model,
     requested: body.model,
     stream: body.stream === true,
