@@ -1263,6 +1263,10 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
         .filter((b: any) => b?.type === "text")
         .map((b: any) => b.text ?? "")
         .join("")
+      // The CLI reports a spent plan as a plain assistant message, not an API Error line.
+      if (/hit your limit|resets \d|5.?hour|usage limit|rate.?limit|too many requests/i.test(text)) {
+        throw upstreamError(429, text.trim())
+      }
     }
   }
   return text.trim()
@@ -1290,7 +1294,9 @@ async function runOneSummary(env: Env, prompt: string): Promise<string> {
 
 /**
  * Summarises the given messages with haiku, in chunks when the history is too large for a single
- * call. Returns empty string on failure so callers fall back to the full history.
+ * call. Throws on failure: the summary and the turn share the same subscription and endpoint, so a
+ * failed summary means the main call would fail too, and replaying the full history would only burn
+ * more against the same wall.
  */
 async function summarizeHistory(messages: any[]): Promise<string> {
   const env = buildCliEnv()
@@ -1307,7 +1313,7 @@ async function summarizeHistory(messages: any[]): Promise<string> {
     for (const chunk of chunks) {
       const prompt = summary ? `${summary}\n\n---\n\n${chunk}` : chunk
       const next = await runOneSummary(env, prompt)
-      if (!next) return summary
+      if (!next) throw new Error("haiku summary returned no text")
       summary = next
     }
     const ratio = inChars > 0 ? Math.round((1 - summary.length / inChars) * 100) : 0
@@ -1324,12 +1330,11 @@ async function summarizeHistory(messages: any[]): Promise<string> {
     })
     return summary
   } catch (error) {
-    // A rate limit on the summarizer means the account is spent; replaying the full history on the
-    // turn model would hit the same wall. Propagate the 429 so the caller stops instead.
-    if (error instanceof ProxyError) throw error
+    // A failed summary means the account is spent or unreachable; the main call shares that fate, so
+    // abort the turn instead of replaying the full history against the same wall.
     console.error("[claude-subscription-proxy] haiku summary failed:", error instanceof Error ? error.message : String(error))
     claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
-    return summary
+    throw error
   }
 }
 
