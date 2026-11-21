@@ -107,7 +107,7 @@ function persistTurn(o: TurnOutcome) {
   const id = o.result ?? (o.completed ? o.resumedId : null)
   if (o.session && id) {
     claudeLog("proxy.session.remember", {
-      sid: id.slice(0, 8),
+      sid: id,
       messages: o.messageCount,
       completed: o.completed,
       viaResult: o.result !== null
