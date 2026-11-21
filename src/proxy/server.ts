@@ -1152,13 +1152,29 @@ const SUMMARIZE_INSTRUCTION = [
   "Output only the summary, with no preamble."
 ].join(" ")
 
-function renderHistoryForSummary(messages: any[]): string {
-  return messages
-    .map((m) => {
-      const role = m?.role === "assistant" ? "assistant" : "user"
-      return `<${role}>\n${renderBlocks(m?.content, new Map())}\n</${role}>`
-    })
-    .join("\n")
+// Haiku's context is 200k tokens. A single cold history can exceed that (the request above a model
+// switch can carry the whole prior conversation), so the summary is built incrementally: split the
+// history into chunks that fit comfortably and fold each into a running summary. ~150k chars is
+// ~37k tokens, leaving ample room for the `claude_code` preset (~21k) plus the reply.
+const SUMMARIZE_CHUNK_CHARS = 150_000
+
+function chunkMessages(messages: any[]): string[] {
+  const chunks: string[] = []
+  let current: string[] = []
+  let chars = 0
+  for (const m of messages) {
+    const role = m?.role === "assistant" ? "assistant" : "user"
+    const block = `<${role}>\n${renderBlocks(m?.content, new Map())}\n</${role}>`
+    if (chars > 0 && chars + block.length > SUMMARIZE_CHUNK_CHARS) {
+      chunks.push(current.join("\n"))
+      current = []
+      chars = 0
+    }
+    current.push(block)
+    chars += block.length
+  }
+  if (current.length > 0) chunks.push(current.join("\n"))
+  return chunks
 }
 
 interface Summarizer {
@@ -1235,24 +1251,45 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
   return text.trim()
 }
 
-/** Summarises the given messages with haiku. Returns empty string on failure so callers fall back. */
-async function summarizeHistory(messages: any[]): Promise<string> {
-  const env = buildCliEnv()
-  if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
-  const prompt = renderHistoryForSummary(messages)
-
+/** Runs one summarizer process to completion and returns its text (empty on failure). */
+async function runOneSummary(env: Env, prompt: string): Promise<string> {
   const entry = warmSummarizer ?? spawnSummarizer(env)
   warmSummarizer = null
   try {
-    const summary = await runSummarizer(entry, prompt)
-    const ratio = prompt.length > 0 ? Math.round((1 - summary.length / prompt.length) * 100) : 0
+    return await runSummarizer(entry, prompt)
+  } finally {
+    discardSummarizer(entry)
+    ensureWarmSummarizer(env)
+  }
+}
+
+/**
+ * Summarises the given messages with haiku, in chunks when the history is too large for a single
+ * call. Returns empty string on failure so callers fall back to the full history.
+ */
+async function summarizeHistory(messages: any[]): Promise<string> {
+  const env = buildCliEnv()
+  if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
+  const chunks = chunkMessages(messages)
+  const inChars = chunks.reduce((n, c) => n + c.length, 0)
+
+  let summary = ""
+  try {
+    for (const chunk of chunks) {
+      const prompt = summary ? `${summary}\n\n---\n\n${chunk}` : chunk
+      const next = await runOneSummary(env, prompt)
+      if (!next) return summary
+      summary = next
+    }
+    const ratio = inChars > 0 ? Math.round((1 - summary.length / inChars) * 100) : 0
     console.log(
-      `[claude-subscription-proxy] haiku summary: ${messages.length} messages, ` +
-        `${prompt.length} -> ${summary.length} chars (${ratio}% smaller)`
+      `[claude-subscription-proxy] haiku summary: ${messages.length} messages in ${chunks.length} chunk(s), ` +
+        `${inChars} -> ${summary.length} chars (${ratio}% smaller)`
     )
     claudeLog("proxy.haiku.summarize", {
       messages: messages.length,
-      inChars: prompt.length,
+      chunks: chunks.length,
+      inChars,
       outChars: summary.length,
       reducedPct: ratio
     })
@@ -1260,10 +1297,7 @@ async function summarizeHistory(messages: any[]): Promise<string> {
   } catch (error) {
     console.error("[claude-subscription-proxy] haiku summary failed:", error instanceof Error ? error.message : String(error))
     claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
-    return ""
-  } finally {
-    discardSummarizer(entry)
-    ensureWarmSummarizer(env)
+    return summary
   }
 }
 
