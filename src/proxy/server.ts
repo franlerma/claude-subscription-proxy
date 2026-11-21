@@ -1,5 +1,4 @@
 import { Hono } from "hono"
-import { cors } from "hono/cors"
 import { query, createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk"
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import { createHash, randomUUID } from "crypto"
@@ -9,11 +8,22 @@ import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { claudeLog } from "../logger"
 import { execSync } from "child_process"
-import { existsSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { homedir } from "os"
-import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, writeFileSync } from "fs"
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync
+} from "fs"
 
 /**
  * Anthropic Messages API facade on top of the Claude Code CLI (Claude Agent SDK).
@@ -268,11 +278,6 @@ function renderBlocks(content: unknown, nameToAlias: Map<string, string>): strin
   return parts.join("\n")
 }
 
-/**
- * The caller's system prompt is appended in plain text, after Claude Code's dynamic boundary.
- * Base64 was inflating it by a third and, worse, made it a huge unbroken token blob that could
- * never share a cache prefix with anything.
- */
 /**
  * Marker Claude Code uses to split its system prompt into a static, cacheable half and a dynamic
  * half. Everything before it gets `cache_control`; everything after stays uncached. Injecting the
@@ -1324,7 +1329,7 @@ async function* runTurnWithFallback(
       return
     }
     if (started || !exact || !/model/i.test(message) || abort.signal.aborted) throw error
-    console.error("[claude-max-proxy] exact model rejected, retrying with alias:", body.model, "-", message.slice(0, 200))
+    console.error("[claude-subscription-proxy] exact model rejected, retrying with alias:", body.model, "-", message.slice(0, 200))
   }
   yield* runTurn(body, new AbortController(), true, callerSession)
 }
@@ -1401,13 +1406,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   const finalConfig = { ...DEFAULT_PROXY_CONFIG, ...config }
   const app = new Hono()
 
-  app.use("*", cors())
-
   app.get("/", (c) => {
     return c.json({
       status: "ok",
-      service: "claude-max-proxy",
-      version: "1.1.0",
+      service: "claude-subscription-proxy",
+      version: "1.0.2",
       format: "anthropic",
       endpoints: ["/v1/messages", "/messages"]
     })
@@ -1448,7 +1451,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             for await (const ev of events) controller.enqueue(sse(ev))
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            console.error("[claude-max-proxy] stream error:", message)
+            console.error("[claude-subscription-proxy] stream error:", message)
             try {
               controller.enqueue(sse({ type: "error", error: { type: "api_error", message } }))
             } catch {}
@@ -1476,7 +1479,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const message = error instanceof Error ? error.message : "Unknown error"
       const status = error instanceof ProxyError ? error.status : errorStatus(message)
       const errorType = error instanceof ProxyError ? error.errorType : "api_error"
-      console.error("[claude-max-proxy] request error:", status, message)
+      console.error("[claude-subscription-proxy] request error:", status, message)
       return c.json({ type: "error", error: { type: errorType, message } }, status as any)
     }
   }
@@ -1501,11 +1504,13 @@ function installAbortGuards() {
 
   process.on("unhandledRejection", (reason) => {
     if (isAbort(reason)) return
+    console.error("[claude-subscription-proxy] unhandled rejection:", reason)
     claudeLog("proxy.unhandled_rejection", { error: String(reason) })
   })
 
   process.on("uncaughtException", (error) => {
     if (isAbort(error)) return
+    console.error("[claude-subscription-proxy] uncaught exception, exiting:", error)
     claudeLog("proxy.uncaught_exception", { error: error instanceof Error ? error.message : String(error) })
     process.exit(1)
   })
@@ -1523,7 +1528,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
     fetch: app.fetch
   })
 
-  console.log(`Claude Max Proxy (Anthropic API) running at http://${finalConfig.host}:${finalConfig.port}`)
+  console.log(`Claude Subscription Proxy (Anthropic API) running at http://${finalConfig.host}:${finalConfig.port}`)
   startSessionSweeper()
 
   return server
