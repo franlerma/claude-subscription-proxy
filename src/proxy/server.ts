@@ -401,7 +401,8 @@ function buildOptions(
   client: ClientTools | null,
   abort: AbortController,
   persist = false,
-  callerSystem = ""
+  callerSystem = "",
+  stderrBuf?: string[]
 ): Record<string, any> {
   const options: Record<string, any> = {
     model,
@@ -425,7 +426,10 @@ function buildOptions(
     persistSession: persist,
     abortController: abort,
     env,
-    stderr: (data: string) => claudeLog("claude.stderr", { data: data.slice(0, 500) })
+    stderr: (data: string) => {
+      if (stderrBuf) stderrBuf.push(data)
+      claudeLog("claude.stderr", { data: data.slice(0, 500) })
+    }
   }
   if (client) {
     options.mcpServers = { [CLIENT_MCP_SERVER]: client.server }
@@ -565,6 +569,12 @@ function buildCliEnv(): Env {
   // Deterministic auto-compact threshold, so the proxy controls transcript size instead of the host.
   if (env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE === undefined) {
     env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(AUTOCOMPACT_PCT)
+  }
+  // The CLI retries a 429 up to 10 times on a subscription, which only burns time (and, on a spent
+  // plan, can never succeed). The proxy owns the retry decision, so cap it here and let a 429 surface
+  // to the caller immediately. Raise CLAUDE_PROXY_MAX_RETRIES to allow a few transient retries.
+  if (env.CLAUDE_CODE_MAX_RETRIES === undefined) {
+    env.CLAUDE_CODE_MAX_RETRIES = String(envInt("CLAUDE_PROXY_MAX_RETRIES", 0))
   }
   return env
 }
@@ -996,6 +1006,8 @@ interface WarmEntry {
   timer: ReturnType<typeof setTimeout>
   /** Message count the caller must have on its next turn for this process to still be valid. */
   expectedMessageCount: number | null
+  /** Accumulated CLI stderr, so a failed turn can report the real reason. */
+  stderr: string[]
 }
 
 /**
@@ -1058,6 +1070,7 @@ function spawnWarm(
 ): WarmEntry {
   const abort = new AbortController()
   const client = clientTools.length > 0 ? buildClientTools(clientTools) : null
+  const stderr: string[] = []
 
   let release!: (prompt: string) => void
   const gate = new Promise<string>((resolve) => (release = resolve))
@@ -1069,7 +1082,7 @@ function spawnWarm(
 
   // A warm process resumes the conversation's transcript when it has one. Without this the pool
   // serves blank processes, which defeat prompt caching entirely.
-  const options = buildOptions(model, env, client, abort, resume !== null, callerSystem) as any
+  const options = buildOptions(model, env, client, abort, resume !== null, callerSystem, stderr) as any
   if (resume) options.resume = resume
   const q = query({ prompt: input(), options })
   const entry: WarmEntry = {
@@ -1079,6 +1092,7 @@ function spawnWarm(
     abort,
     resume,
     expectedMessageCount,
+    stderr,
     send: release,
     timer: setTimeout(() => {
       if (warmPool.get(key) !== entry) return
@@ -1181,12 +1195,15 @@ interface Summarizer {
   query: Query
   abort: AbortController
   send: (prompt: string) => void
+  /** Accumulates the CLI's stderr so failures surface the real reason, not just the exit code. */
+  stderr: string[]
 }
 
 let warmSummarizer: Summarizer | null = null
 
 function spawnSummarizer(env: Env): Summarizer {
   const abort = new AbortController()
+  const stderr: string[] = []
   let release!: (prompt: string) => void
   const gate = new Promise<string>((resolve) => (release = resolve))
   async function* input(): AsyncGenerator<SDKUserMessage> {
@@ -1209,10 +1226,10 @@ function spawnSummarizer(env: Env): Summarizer {
     persistSession: false,
     abortController: abort,
     env,
-    stderr: (data: string) => claudeLog("proxy.haiku.stderr", { data: data.slice(0, 500) })
+    stderr: (data: string) => stderr.push(data)
   }
   const q = query({ prompt: input(), options })
-  return { query: q, abort, send: release }
+  return { query: q, abort, send: release, stderr }
 }
 
 function discardSummarizer(entry: Summarizer) {
@@ -1257,6 +1274,14 @@ async function runOneSummary(env: Env, prompt: string): Promise<string> {
   warmSummarizer = null
   try {
     return await runSummarizer(entry, prompt)
+  } catch (error) {
+    // Always surface the CLI's own stderr: the exit code alone hides the real reason (429, etc.).
+    const stderr = entry.stderr.join("").trim()
+    if (stderr) console.error(`[claude-subscription-proxy] haiku CLI stderr:\n${stderr.slice(0, 1500)}`)
+    if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
+      throw upstreamError(429, stderr.slice(0, 1000))
+    }
+    throw error
   } finally {
     discardSummarizer(entry)
     ensureWarmSummarizer(env)
@@ -1272,6 +1297,10 @@ async function summarizeHistory(messages: any[]): Promise<string> {
   if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
   const chunks = chunkMessages(messages)
   const inChars = chunks.reduce((n, c) => n + c.length, 0)
+
+  console.log(
+    `[claude-subscription-proxy] haiku summary: starting, ${messages.length} messages in ${chunks.length} chunk(s), ${inChars} chars`
+  )
 
   let summary = ""
   try {
@@ -1295,6 +1324,9 @@ async function summarizeHistory(messages: any[]): Promise<string> {
     })
     return summary
   } catch (error) {
+    // A rate limit on the summarizer means the account is spent; replaying the full history on the
+    // turn model would hit the same wall. Propagate the 429 so the caller stops instead.
+    if (error instanceof ProxyError) throw error
     console.error("[claude-subscription-proxy] haiku summary failed:", error instanceof Error ? error.message : String(error))
     claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
     return summary
@@ -1406,6 +1438,8 @@ async function* runTurn(
   })
 
   let response: Query
+  const coldStderr: string[] = []
+  const stderrBuf = () => (warm ? warm.stderr : coldStderr).join("").trim()
   if (warm) {
     // The warm CLI has its own AbortController: forward the request's abort to it.
     const kill = () => warm.abort.abort()
@@ -1414,7 +1448,7 @@ async function* runTurn(
     warm.send(prompt)
     response = warm.query
   } else {
-    const options = buildOptions(model, env, client, abort, track, system) as any
+    const options = buildOptions(model, env, client, abort, track, system, coldStderr) as any
     if (useResume) {
       options.resume = resume
     }
@@ -1514,7 +1548,20 @@ async function* runTurn(
     if (!started) throw new Error("Claude Code returned no message")
   } catch (error) {
     // Aborting after we got what we needed is expected and not an error.
-    if (!(started && abort.signal.aborted)) throw error
+    if (started && abort.signal.aborted) {
+      // expected
+    } else {
+      // The CLI wraps upstream failures as a bare exit code; the real cause (e.g. a 429) is only on
+      // its stderr. Surface a rate limit as HTTP 429 immediately instead of a generic 500.
+      const stderr = stderrBuf()
+      if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
+        throw upstreamError(429, stderr.slice(0, 1000))
+      }
+      if (stderr && error instanceof Error && /process exited|no message/i.test(error.message)) {
+        throw new Error(`${error.message}: ${stderr.slice(0, 1000)}`)
+      }
+      throw error
+    }
   } finally {
     // Always let the CLI finish writing its transcript and report the session id, even when the
     // caller already got its message. Killing it here is what left nothing to resume from.
