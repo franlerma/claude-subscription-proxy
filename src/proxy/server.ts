@@ -1161,10 +1161,9 @@ function topUpWarm(
 // ---------------------------------------------------------------------------------------
 
 const SUMMARIZE_INSTRUCTION = [
-  "You are producing a compact context summary so a conversation can continue in a fresh context.",
-  "First explore the project to understand it: read the README if it exists, any AGENTS.md or other markdown documentation, and the source files the recent messages point at. Read only what you need — do not explore exhaustively.",
-  "Then produce a concise, structured summary of: what the project is, what we are currently trying to achieve, decisions made and their rationale, file paths and what changed in them, commands run and their results, and any unresolved next steps.",
-  "Output only the summary, with no preamble."
+  "You are compressing a conversation so it can continue in a fresh context.",
+  "From the recent history below, produce a short summary of what the user is trying to achieve right now, plus the key decisions and file paths from the recent turns.",
+  "Be as concise, fast and token-efficient as possible: a few short lines, no structure headings, no preamble, nothing that is not essential."
 ].join(" ")
 
 // The whole cold history is far too expensive to summarise (and the main model far too expensive to
@@ -1221,12 +1220,12 @@ function spawnSummarizer(env: Env): Summarizer {
       preset: "claude_code" as const,
       append: `${SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n${SUMMARIZE_INSTRUCTION}`
     },
-    // Read-only tools so the summarizer can re-read the project instead of receiving the whole history.
-    allowedTools: ["Read", "Glob", "Grep"],
-    disallowedTools: ["Bash", "Edit", "Write", "WebFetch", "WebSearch", "Task", "TodoWrite"],
+    // No tools: the summarizer only interpolates a short summary from the recent history it is given.
+    // Exploring the project was too slow and made the summary unpredictable. The main model does its
+    // own reading on the next turn without being conditioned by a pre-baked summary.
+    tools: [],
     settingSources: [],
-    // No maxTurns cap: the prompt tells it to read only what it needs, and the single input message
-    // ends the stream. A cap here would stop it mid-read and return no summary text.
+    maxTurns: 1,
     includePartialMessages: false,
     persistSession: false,
     abortController: abort,
@@ -1263,13 +1262,19 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
   let text = ""
   for await (const message of entry.query) {
     if (message.type === "assistant") {
+      // A spent plan surfaces as a synthetic assistant message with an `error` field, or as the exact
+      // literal "You've hit your limit ... (UTC)" text. Only those are rate limits — the summary's own
+      // text may legitimately mention "usage" or "rate" and must not be misread as one.
+      const err = (message as any).error
+      if (err === "rate_limit" || err === "billing_error") {
+        throw upstreamError(429, err)
+      }
       const blocks: any[] = Array.isArray(message.message?.content) ? message.message.content : []
       text = blocks
         .filter((b: any) => b?.type === "text")
         .map((b: any) => b.text ?? "")
         .join("")
-      // The CLI reports a spent plan as a plain assistant message, not an API Error line.
-      if (/hit your limit|resets \d|5.?hour|usage limit|rate.?limit|too many requests/i.test(text)) {
+      if (/^You've hit your limit\b/.test(text.trim()) || /^API Error:\s*429\b/.test(text.trim())) {
         throw upstreamError(429, text.trim())
       }
     }
