@@ -1198,6 +1198,8 @@ interface Summarizer {
   send: (prompt: string) => void
   /** Accumulates the CLI's stderr so failures surface the real reason, not just the exit code. */
   stderr: string[]
+  /** Persistent iterator over the query, so consecutive turns read from the same stream position. */
+  iterator: AsyncIterator<any>
 }
 
 let warmSummarizer: Summarizer | null = null
@@ -1249,7 +1251,8 @@ function spawnSummarizer(env: Env): Summarizer {
       wake?.()
       wake = null
     },
-    stderr
+    stderr,
+    iterator: q[Symbol.asyncIterator]()
   }
 }
 
@@ -1277,12 +1280,14 @@ function ensureWarmSummarizer(env: Env) {
 async function runSummarizer(entry: Summarizer, prompt: string): Promise<string> {
   entry.send(prompt)
   let text = ""
-  // Read exactly one turn: with a persistent multi-turn process the stream does not end after one
-  // assistant message, so a for-await would hang waiting for the next chunk. A turn ends with its
-  // `result` message.
-  for await (const message of entry.query) {
+  // Read exactly one turn from the persistent iterator: a multi-turn process does not end its stream
+  // after one assistant message, so a fresh for-await would create a new iterator and miss the reply.
+  // A turn ends with its `result` message.
+  while (true) {
+    const { value: message, done } = await entry.iterator.next()
+    if (done) break
     if (message.type === "assistant") {
-      const blocks: any[] = Array.isArray((message as any).message?.content) ? (message as any).message.content : []
+      const blocks: any[] = Array.isArray(message.message?.content) ? message.message.content : []
       text = blocks
         .filter((b: any) => b?.type === "text")
         .map((b: any) => b.text ?? "")
