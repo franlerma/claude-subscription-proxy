@@ -7,6 +7,8 @@ Use your **Claude subscription** (Max or Pro) with OpenCode or any other Anthrop
 
 > **Disclaimer:** This project is non-profit and made for educational and research purposes only.
 
+> **Fork notice:** This project is a fork of [opencode-claude-max-proxy](https://github.com/rynfar/opencode-claude-max-proxy) by [rynfar](https://github.com/rynfar). The original proxy idea and base implementation come from that project; see [Credits](#credits) and [What this fork adds](#what-this-fork-adds).
+
 ## The Problem
 
 Anthropic doesn't allow Claude Max subscribers to use their subscription with third-party tools like OpenCode. If you want to use Claude in OpenCode, you have to pay for API access separately - even though you're already paying for "unlimited" Claude.
@@ -226,11 +228,9 @@ When `CLAUDE_PROXY_SESSION` is enabled and the caller sends a session header, th
 
 Reuse falls back to the full history whenever it cannot be trusted: the conversation is new, compaction/retry shortened or rewrote the history, the assistant turn is missing from the slot the transcript expects, or the remembered transcript has disappeared from disk.
 
-Each mapping is written atomically to its own file under `CLAUDE_PROXY_CONFIG_DIR/sessions/` (one `sha256(callerKey).json` per conversation), so a proxy restart resumes the same transcripts instead of paying a cold cache write for every conversation. One session's write or corruption cannot take down the others, and expiry deletes exactly one file. The old single `sessions.json` is migrated automatically on first start (kept as `sessions.json.migrated` until the TTL sweep removes it). On restart the system prompt is re-frozen from the first resumed request.
+Each mapping is written atomically to its own file under `CLAUDE_PROXY_CONFIG_DIR/sessions/` (one `sha256(callerKey).json` per conversation), so a proxy restart resumes the same transcripts instead of paying a cold cache write for every conversation. One session's write or corruption cannot take down the others, and expiry deletes exactly one file. The old single `sessions.json` is migrated automatically on first start (kept as `sessions.json.migrated` until the TTL sweep removes it).
 
 The background sweep also deletes idle files under `projects/`, `debug/`, `todos/`, `shell-snapshots/` and `statsig/`, and keeps only the five newest `.claude.json.backup.*` files, inside the proxy's isolated config dir. It never touches `.claude.json`, credentials or `plugins/`.
-
-When the caller's system prompt changes mid-conversation, the proxy keeps the original prompt in Claude Code's cached system block and appends the new one as a `<caller_system_prompt_update>` message. That mirrors how Claude Code handles resumed sessions and avoids invalidating the system prompt plus every tool definition ahead of it.
 
 ## How It Works
 
@@ -282,6 +282,10 @@ MIT
 
 ## Credits
 
-This project is a fork of [opencode-claude-max-proxy](https://github.com/rynfar/opencode-claude-max-proxy) by [rynfar](https://github.com/rynfar), which served as the foundation and inspiration for this project.
+This project is a fork of [opencode-claude-max-proxy](https://github.com/rynfar/opencode-claude-max-proxy) by [rynfar](https://github.com/rynfar), which served as the foundation and inspiration for this project. The original is also MIT licensed.
+
+- Original project: <https://github.com/rynfar/opencode-claude-max-proxy>
+- Original author: [rynfar](https://github.com/rynfar)
+- Changes in this fork: see [What this fork adds](#what-this-fork-adds)
 
 Built with the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) by Anthropic.

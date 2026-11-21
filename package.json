@@ -1,11 +1,11 @@
 {
-  "name": "opencode-claude-max-proxy",
+  "name": "claude-subscription-proxy",
   "version": "1.0.2",
   "description": "Use your Claude Max subscription with OpenCode via proxy server",
   "type": "module",
   "main": "./src/proxy/server.ts",
   "bin": {
-    "claude-max-proxy": "./bin/claude-proxy.ts"
+    "claude-subscription-proxy": "./bin/claude-proxy.ts"
   },
   "exports": {
     ".": "./src/proxy/server.ts"
@@ -49,13 +49,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rynfar/opencode-claude-max-proxy.git"
+    "url": "git+https://github.com/franlerma/claude-subscription-proxy.git"
   },
-  "homepage": "https://github.com/rynfar/opencode-claude-max-proxy#readme",
+  "homepage": "https://github.com/franlerma/claude-subscription-proxy#readme",
   "bugs": {
-    "url": "https://github.com/rynfar/opencode-claude-max-proxy/issues"
+    "url": "https://github.com/franlerma/claude-subscription-proxy/issues"
   },
-  "author": "rynfar",
+  "author": "Fran Lerma",
   "license": "MIT",
   "private": false
 }
