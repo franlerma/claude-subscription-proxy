@@ -972,10 +972,16 @@ function warmKey(shape: string, sessionKey: string): string {
 
 function discardWarm(entry: WarmEntry) {
   clearTimeout(entry.timer)
-  entry.send("")
-  entry.abort.abort()
+  // Close the query before aborting: aborting first makes the SDK's control-request writer
+  // throw "Operation aborted" on an already-closed stdin, which crashes the whole process.
   try {
     entry.query.close()
+  } catch {}
+  try {
+    entry.abort.abort()
+  } catch {}
+  try {
+    entry.send("")
   } catch {}
 }
 
@@ -1470,7 +1476,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   return { app, config: finalConfig }
 }
 
+/**
+ * The SDK aborts its control-request writer with "Operation aborted" whenever a turn (or a warm
+ * process) is discarded. That is expected cleanup, not a fatal condition: without these handlers the
+ * rejection surfaces as an uncaught exception and kills the whole proxy, dropping every session and
+ * warm process. Keep the process alive; only log genuinely unexpected errors.
+ */
+function installAbortGuards() {
+  const isAbort = (reason: unknown) =>
+    reason instanceof Error
+      ? /aborted|abort/i.test(reason.message)
+      : /aborted|abort/i.test(String(reason))
+
+  process.on("unhandledRejection", (reason) => {
+    if (isAbort(reason)) return
+    claudeLog("proxy.unhandled_rejection", { error: String(reason) })
+  })
+
+  process.on("uncaughtException", (error) => {
+    if (isAbort(error)) return
+    claudeLog("proxy.uncaught_exception", { error: error instanceof Error ? error.message : String(error) })
+    process.exit(1)
+  })
+}
+
 export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
+  installAbortGuards()
   const { app, config: finalConfig } = createProxyServer(config)
 
   const server = Bun.serve({
