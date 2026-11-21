@@ -11,7 +11,7 @@ Hard-won lessons about the Claude Agent SDK and this proxy, so future iterations
 ## First-party vs third-party billing
 
 - The system prompt is what keeps a request first-party. Use `{ type: "preset", preset: "claude_code" }` and append any custom text **after** `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`. Appending caller text directly onto the preset re-classifies the request as third-party and bills "extra usage".
-- `tools: []` does **not** affect first-party classification. Only the system prompt does. The haiku summarizer runs the preset + boundary + its instruction, with `tools: []`, and stays first-party.
+- `tools: []` does **not** affect first-party classification. Only the system prompt does. The haiku summarizer runs the preset + boundary + its instruction and stays first-party regardless of its tool set.
 
 ## CLI errors are hidden behind "exited with code 1"
 
@@ -24,30 +24,12 @@ Hard-won lessons about the Claude Agent SDK and this proxy, so future iterations
 - The CLI retries a 429 up to **10 times** on a subscription (`CLAUDE_CODE_MAX_RETRIES` default 10, and it retries 429 when OAuth/subscription is detected). Set `CLAUDE_CODE_MAX_RETRIES` yourself; a spent plan can never succeed, so cap it at 0 and fail fast.
 - opencode/litellm also retry on 429 on their side. The proxy's job is to answer fast and correctly, not to absorb retries.
 
-## The summarizer (multi-turn haiku)
+## The summarizer (haiku)
 
-- One cold history can exceed haiku's 200k context (the request above a model switch carries the whole prior conversation). Chunk the history and fold each chunk into a running summary. `~150k chars` (~37k tokens) per chunk leaves room for the ~21k preset plus the reply.
-- **Reuse ONE haiku process for all chunks.** `maxTurns: 1` + one process per chunk pays the CLI start-up and the cached prefix once per chunk — an 8-chunk history meant 8 cold cache writes and read as a timeout.
-- The summarizer uses a `query({ prompt: <AsyncIterable> })` with an internal prompt queue. The input generator blocks until a prompt is queued, then yields it; a sentinel empty prompt ends the stream.
-
-### CRITICAL: reuse the query iterator, don't re-create it
-
-A multi-turn process does not end its stream after one assistant message. A fresh `for await (const m of entry.query)` **creates a new async iterator** each turn, so the second turn's reply is never delivered and the summary returns empty ("no text"). Hold **one persistent iterator** and read each turn through it:
-
-```ts
-const iterator = q[Symbol.asyncIterator]()   // once, at spawn
-// per turn:
-while (true) {
-  const { value, done } = await iterator.next()
-  if (done) break
-  if (value.type === "assistant") { /* capture text */ }
-  else if (value.type === "result") break    // one turn ends at its result
-}
-```
-
-This mirrors how `SDKSession` multiplexes `send`/`stream` over a single iterator.
-
-- Read the summary text from the assistant message's `content` blocks filtered by `type === "text"`. A single turn can emit several assistant messages (one with `thinking` content, then the final text) — keep the last non-empty text.
+- **Never summarise the whole cold history.** A model-switch request can carry ~1M chars (~250k tokens) of prior conversation. Summarising all of it was infeasible in time (and multi-chunk was 8 CLI start-ups + 8 cold cache writes), and feeding it to the turn model is the expensive line: ~$0.70-1.10/turn on Sonnet. The haiku summary itself is ~$0.01.
+- Instead send haiku **only the recent tail** (~8 messages, ~12k chars / ~3k tokens) **plus read access to the project**, and let it re-read the code (`Read`/`Glob`/`Grep` via `allowedTools`) for the deep context. The tail must cover the current intent and the immediate tool results, nothing older — the code is the source of truth for the rest.
+- One warm haiku process (`maxTurns: 1`) is kept waiting so the CLI start-up and the cached `claude_code` prefix are paid once, not per summary. `persistSession: false` keeps it out of the session store.
+- A single turn can emit several assistant messages (one with `thinking` content, then the final text). Read the summary from `content` blocks filtered by `type === "text"` and keep the last non-empty text.
 
 ## The main turn (`runTurn`)
 
@@ -55,6 +37,10 @@ This mirrors how `SDKSession` multiplexes `send`/`stream` over a single iterator
 - The turn must drain the CLI to its `result` **after** emitting `message_stop`, because only `result` carries the session id and flushes the transcript needed to resume the next turn. Don't abort early.
 - `warmPool` is keyed by conversation (not model shape): keying by shape handed out blank CLIs and burned the cache. A warm process must resume the conversation's transcript.
 - The warm replacement is spawned **after** the turn, holding the id the turn actually produced; spawning it before resumed the previous id and forked the conversation.
+
+## SDK gotchas
+
+- If you ever drive a **multi-turn** `query({ prompt: <AsyncIterable> })` and read replies yourself, hold **one** `q[Symbol.asyncIterator]()` and reuse it across turns. A fresh `for await (const m of q)` creates a new iterator each turn, so the second turn's reply is never delivered. (The current summarizer is single-turn, so this does not bite it — but it did bite the earlier chunked version.)
 
 ## Other
 

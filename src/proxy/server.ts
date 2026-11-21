@@ -1161,69 +1161,58 @@ function topUpWarm(
 // ---------------------------------------------------------------------------------------
 
 const SUMMARIZE_INSTRUCTION = [
-  "You are summarizing a prior conversation so it can continue in a fresh context.",
-  "Produce a concise, structured summary that preserves: decisions made and their rationale, file paths and what changed in them, commands run and their results, and any unresolved next steps.",
+  "You are producing a compact context summary so a conversation can continue in a fresh context.",
+  "First read the most important parts of the project to understand it (README, AGENTS.md, and the files the recent messages point at).",
+  "Then produce a concise, structured summary of: what the project is, what we are currently trying to achieve, decisions made and their rationale, file paths and what changed in them, commands run and their results, and any unresolved next steps.",
   "Output only the summary, with no preamble."
 ].join(" ")
 
-// Haiku's context is 200k tokens. A single cold history can exceed that (the request above a model
-// switch can carry the whole prior conversation), so the summary is built incrementally: split the
-// history into chunks that fit comfortably and fold each into a running summary. ~150k chars is
-// ~37k tokens, leaving ample room for the `claude_code` preset (~21k) plus the reply.
-const SUMMARIZE_CHUNK_CHARS = 150_000
+// The whole cold history is far too expensive to summarise (and the main model far too expensive to
+// feed it to). Instead send haiku only the recent tail plus read access to the project, and let it
+// re-read the code for the deep context. Keep the tail tiny: the last ~8 messages, capped at ~12k
+// chars (~3k tokens), which is enough for the current intent and the immediate tool results.
+const SUMMARIZE_TAIL_MESSAGES = 8
+const SUMMARIZE_TAIL_CHARS = 12_000
 
-function chunkMessages(messages: any[]): string[] {
-  const chunks: string[] = []
-  let current: string[] = []
+/** The recent history tail, oldest-first, capped by message count and char budget. */
+function recentHistory(messages: any[]): string {
+  const blocks: string[] = []
   let chars = 0
-  for (const m of messages) {
+  // Walk backwards so the most recent messages always fit within the budget.
+  for (let i = messages.length - 1; i >= 0 && blocks.length < SUMMARIZE_TAIL_MESSAGES; i--) {
+    const m = messages[i]
     const role = m?.role === "assistant" ? "assistant" : "user"
     const block = `<${role}>\n${renderBlocks(m?.content, new Map())}\n</${role}>`
-    if (chars > 0 && chars + block.length > SUMMARIZE_CHUNK_CHARS) {
-      chunks.push(current.join("\n"))
-      current = []
-      chars = 0
-    }
-    current.push(block)
+    if (chars + block.length > SUMMARIZE_TAIL_CHARS && blocks.length > 0) break
+    blocks.push(block)
     chars += block.length
   }
-  if (current.length > 0) chunks.push(current.join("\n"))
-  return chunks
+  return blocks.reverse().join("\n")
 }
 
 interface Summarizer {
   query: Query
   abort: AbortController
-  /** Queues the next prompt for the running multi-turn process. */
   send: (prompt: string) => void
   /** Accumulates the CLI's stderr so failures surface the real reason, not just the exit code. */
   stderr: string[]
-  /** Persistent iterator over the query, so consecutive turns read from the same stream position. */
-  iterator: AsyncIterator<any>
 }
 
 let warmSummarizer: Summarizer | null = null
 
-// One haiku process folds every chunk into a running summary. This reuses the CLI start-up and the
-// cached `claude_code` prefix across chunks, instead of paying both once per chunk. The queue lets the
-// consumer feed the next chunk only after the previous one's reply, so the running summary is known.
+// One haiku process per summary. It gets the recent history tail plus read access to the project, and
+// re-reads the code for the deep context instead of receiving the whole cold history. Kept warm so
+// the CLI start-up is paid once, not per summary.
 function spawnSummarizer(env: Env): Summarizer {
   const abort = new AbortController()
   const stderr: string[] = []
-  const queue: string[] = []
-  let wake: (() => void) | null = null
-
+  let release!: (prompt: string) => void
+  const gate = new Promise<string>((resolve) => (release = resolve))
   async function* input(): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (queue.length === 0) {
-        await new Promise<void>((resolve) => (wake = resolve))
-      }
-      const prompt = queue.shift()
-      if (!prompt) return
-      yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" }
-    }
+    const prompt = await gate
+    if (!prompt) return
+    yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" }
   }
-
   const options: Record<string, any> = {
     model: "haiku",
     pathToClaudeCodeExecutable: claudeExecutable,
@@ -1232,10 +1221,11 @@ function spawnSummarizer(env: Env): Summarizer {
       preset: "claude_code" as const,
       append: `${SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n${SUMMARIZE_INSTRUCTION}`
     },
-    tools: [],
+    // Read-only tools so the summarizer can re-read the project instead of receiving the whole history.
+    allowedTools: ["Read", "Glob", "Grep"],
+    disallowedTools: ["Bash", "Edit", "Write", "WebFetch", "WebSearch", "Task", "TodoWrite"],
     settingSources: [],
-    // No maxTurns cap: the queue drives the loop, one user message per chunk. A sentinel empty prompt
-    // in discardSummarizer ends the stream.
+    maxTurns: 1,
     includePartialMessages: false,
     persistSession: false,
     abortController: abort,
@@ -1243,17 +1233,7 @@ function spawnSummarizer(env: Env): Summarizer {
     stderr: (data: string) => stderr.push(data)
   }
   const q = query({ prompt: input(), options })
-  return {
-    query: q,
-    abort,
-    send: (prompt: string) => {
-      queue.push(prompt)
-      wake?.()
-      wake = null
-    },
-    stderr,
-    iterator: q[Symbol.asyncIterator]()
-  }
+  return { query: q, abort, send: release, stderr }
 }
 
 function discardSummarizer(entry: Summarizer) {
@@ -1280,12 +1260,7 @@ function ensureWarmSummarizer(env: Env) {
 async function runSummarizer(entry: Summarizer, prompt: string): Promise<string> {
   entry.send(prompt)
   let text = ""
-  // Read exactly one turn from the persistent iterator: a multi-turn process does not end its stream
-  // after one assistant message, so a fresh for-await would create a new iterator and miss the reply.
-  // A turn ends with its `result` message.
-  while (true) {
-    const { value: message, done } = await entry.iterator.next()
-    if (done) break
+  for await (const message of entry.query) {
     if (message.type === "assistant") {
       const blocks: any[] = Array.isArray(message.message?.content) ? message.message.content : []
       text = blocks
@@ -1296,50 +1271,40 @@ async function runSummarizer(entry: Summarizer, prompt: string): Promise<string>
       if (/hit your limit|resets \d|5.?hour|usage limit|rate.?limit|too many requests/i.test(text)) {
         throw upstreamError(429, text.trim())
       }
-    } else if (message.type === "result") {
-      break
     }
   }
   return text.trim()
 }
 
 /**
- * Summarises the given messages with haiku, in chunks when the history is too large for a single
- * call. Throws on failure: the summary and the turn share the same subscription and endpoint, so a
- * failed summary means the main call would fail too, and replaying the full history would only burn
- * more against the same wall.
+ * Produces a compact context summary with haiku: it receives the recent history tail plus read access
+ * to the project and re-reads the code for the deep context, instead of the whole cold history.
+ * Throws on failure: the summary and the turn share the same subscription and endpoint, so a failed
+ * summary means the main call would fail too, and replaying the full history would only burn more.
  */
 async function summarizeHistory(messages: any[]): Promise<string> {
   const env = buildCliEnv()
   if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
-  const chunks = chunkMessages(messages)
-  const inChars = chunks.reduce((n, c) => n + c.length, 0)
+  const tail = recentHistory(messages)
+  const inChars = tail.length
 
   console.log(
-    `[claude-subscription-proxy] haiku summary: starting, ${messages.length} messages in ${chunks.length} chunk(s), ${inChars} chars`
+    `[claude-subscription-proxy] haiku summary: starting, ${messages.length} messages total, recent ${inChars} chars`
   )
 
-  // One warm process folds every chunk into a running summary, so the CLI start-up and the cached
-  // prefix are paid once for the whole history, not once per chunk.
   const entry = warmSummarizer ?? spawnSummarizer(env)
   warmSummarizer = null
 
-  let summary = ""
   try {
-    for (const chunk of chunks) {
-      const prompt = summary ? `${summary}\n\n---\n\n${chunk}` : chunk
-      const next = await runSummarizer(entry, prompt)
-      if (!next) throw new Error("haiku summary returned no text")
-      summary = next
-    }
+    const summary = await runSummarizer(entry, tail)
+    if (!summary) throw new Error("haiku summary returned no text")
     const ratio = inChars > 0 ? Math.round((1 - summary.length / inChars) * 100) : 0
     console.log(
-      `[claude-subscription-proxy] haiku summary: ${messages.length} messages in ${chunks.length} chunk(s), ` +
+      `[claude-subscription-proxy] haiku summary: ${messages.length} messages total, ` +
         `${inChars} -> ${summary.length} chars (${ratio}% smaller)`
     )
     claudeLog("proxy.haiku.summarize", {
       messages: messages.length,
-      chunks: chunks.length,
       inChars,
       outChars: summary.length,
       reducedPct: ratio
