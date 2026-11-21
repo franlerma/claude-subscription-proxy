@@ -488,6 +488,40 @@ const SESSION_CONFIG_DIR =
 const SESSION_FINGERPRINT_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_SESSION_FINGERPRINT", 1))
 
 // ---------------------------------------------------------------------------------------
+// History compaction on model switch
+//
+// The prompt cache is per model. When a conversation arrives for a model with no Claude transcript
+// to resume (a model switch, e.g. the caller was talking to Deepseek and now asks Claude), the whole
+// history is re-sent and billed as a cold cache write with no chance of ever being read back. That
+// is the one case where the history is worth compacting: summarise the old tail with a dedicated
+// haiku process and keep only the newest messages verbatim. In the same model, resuming the live
+// transcript already reads the stable prefix from cache, so history is never compacted there.
+//   CLAUDE_PROXY_COMPACT_HISTORY_TOKENS  char/4 estimate over which a cold history is summarised
+//                                        (default 40000; set 0 to disable)
+//   CLAUDE_PROXY_COMPACT_KEEP_MESSAGES   newest messages kept verbatim after the summary (default 4)
+// ---------------------------------------------------------------------------------------
+
+const DEFAULT_COMPACT_HISTORY_TOKENS = 40_000
+
+const COMPACT_HISTORY_TOKENS = (() => {
+  const raw = process.env.CLAUDE_PROXY_COMPACT_HISTORY_TOKENS
+  if (raw === undefined || raw === "") return DEFAULT_COMPACT_HISTORY_TOKENS
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_COMPACT_HISTORY_TOKENS
+})()
+const COMPACT_KEEP_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_COMPACT_KEEP_MESSAGES", 4))
+
+/** Rough char/4 token estimate over the whole conversation, for deciding whether to compact. */
+function estimateHistoryTokens(messages: any[]): number {
+  let chars = 0
+  for (const m of messages) {
+    if (!m) continue
+    chars += 4 + (typeof m.role === "string" ? m.role.length : 0) + renderBlocks(m.content, new Map()).length
+  }
+  return Math.ceil(chars / 4)
+}
+
+// ---------------------------------------------------------------------------------------
 // Environment hardening
 //
 // The proxy process often inherits the caller's shell environment. A stray ANTHROPIC_API_KEY
@@ -544,6 +578,8 @@ interface SessionState {
   id: string
   messageCount: number
   updatedAt: number
+  /** Model the transcript was last served with, to detect a model switch mid-conversation. */
+  model?: string
   /** In-memory TTL timer; never persisted. */
   timer?: ReturnType<typeof setTimeout>
 }
@@ -615,7 +651,8 @@ function readSessionFile(path: string): { key: string; state: SessionState } | n
       state: {
         id: parsed.id,
         messageCount: Number.isFinite(parsed.messages) ? Math.max(0, Math.floor(parsed.messages)) : 0,
-        updatedAt: parsed.updated
+        updatedAt: parsed.updated,
+        model: typeof parsed.model === "string" ? parsed.model : undefined
       }
     }
   } catch {
@@ -637,7 +674,8 @@ function writeSessionFile(key: string, state: SessionState): boolean {
         key,
         id: state.id,
         messages: state.messageCount,
-        updated: state.updatedAt
+        updated: state.updatedAt,
+        model: state.model ?? null
       }),
       { mode: 0o600 }
     )
@@ -664,7 +702,8 @@ function migrateLegacySessions(cutoff: number) {
       const state: SessionState = {
         id: entry.id,
         messageCount: Number.isFinite(entry.messages) ? Math.max(0, Math.floor(entry.messages)) : 0,
-        updatedAt: entry.updated
+        updatedAt: entry.updated,
+        model: typeof entry.model === "string" ? entry.model : undefined
       }
       sessions.set(entry.key, state)
       if (writeSessionFile(entry.key, state)) migrated++
@@ -1096,6 +1135,154 @@ function topUpWarm(
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// Haiku summarizer (history compaction)
+//
+// A dedicated haiku process compacts a cold, oversized history before it is handed to the turn's
+// model. It shares the caller's subscription, so it must stay first-party: it runs the `claude_code`
+// preset with the summary instruction appended after the dynamic boundary, exactly like a normal
+// turn. `persistSession: false` keeps it out of the session store; `tools: []` runs nothing on the
+// host. One process is kept warm waiting for work; concurrent summaries spawn as many extra
+// processes as needed, and each is discarded after one summary, leaving a single warm process behind.
+// ---------------------------------------------------------------------------------------
+
+const SUMMARIZE_INSTRUCTION = [
+  "You are summarizing a prior conversation so it can continue in a fresh context.",
+  "Produce a concise, structured summary that preserves: decisions made and their rationale, file paths and what changed in them, commands run and their results, and any unresolved next steps.",
+  "Output only the summary, with no preamble."
+].join(" ")
+
+function renderHistoryForSummary(messages: any[]): string {
+  return messages
+    .map((m) => {
+      const role = m?.role === "assistant" ? "assistant" : "user"
+      return `<${role}>\n${renderBlocks(m?.content, new Map())}\n</${role}>`
+    })
+    .join("\n")
+}
+
+interface Summarizer {
+  query: Query
+  abort: AbortController
+  send: (prompt: string) => void
+}
+
+let warmSummarizer: Summarizer | null = null
+
+function spawnSummarizer(env: Env): Summarizer {
+  const abort = new AbortController()
+  let release!: (prompt: string) => void
+  const gate = new Promise<string>((resolve) => (release = resolve))
+  async function* input(): AsyncGenerator<SDKUserMessage> {
+    const prompt = await gate
+    if (!prompt) return
+    yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" }
+  }
+  const options: Record<string, any> = {
+    model: "haiku",
+    pathToClaudeCodeExecutable: claudeExecutable,
+    systemPrompt: {
+      type: "preset" as const,
+      preset: "claude_code" as const,
+      append: `${SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n${SUMMARIZE_INSTRUCTION}`
+    },
+    tools: [],
+    settingSources: [],
+    maxTurns: 1,
+    includePartialMessages: false,
+    persistSession: false,
+    abortController: abort,
+    env,
+    stderr: (data: string) => claudeLog("proxy.haiku.stderr", { data: data.slice(0, 500) })
+  }
+  const q = query({ prompt: input(), options })
+  return { query: q, abort, send: release }
+}
+
+function discardSummarizer(entry: Summarizer) {
+  try {
+    entry.query.close()
+  } catch {}
+  try {
+    entry.abort.abort()
+  } catch {}
+  try {
+    entry.send("")
+  } catch {}
+}
+
+function ensureWarmSummarizer(env: Env) {
+  if (warmSummarizer) return
+  try {
+    warmSummarizer = spawnSummarizer(env)
+  } catch (error) {
+    claudeLog("proxy.haiku.warm_failed", { error: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+async function runSummarizer(entry: Summarizer, prompt: string): Promise<string> {
+  entry.send(prompt)
+  let text = ""
+  for await (const message of entry.query) {
+    if (message.type === "assistant") {
+      const blocks: any[] = Array.isArray((message as any).message?.content) ? (message as any).message.content : []
+      text = blocks
+        .filter((b: any) => b?.type === "text")
+        .map((b: any) => b.text ?? "")
+        .join("")
+    }
+  }
+  return text.trim()
+}
+
+/** Summarises the given messages with haiku. Returns empty string on failure so callers fall back. */
+async function summarizeHistory(messages: any[]): Promise<string> {
+  const env = buildCliEnv()
+  if (SESSION_MODE) env.CLAUDE_CONFIG_DIR = SESSION_CONFIG_DIR
+  const prompt = renderHistoryForSummary(messages)
+
+  const entry = warmSummarizer ?? spawnSummarizer(env)
+  warmSummarizer = null
+  try {
+    const summary = await runSummarizer(entry, prompt)
+    const ratio = prompt.length > 0 ? Math.round((1 - summary.length / prompt.length) * 100) : 0
+    console.log(
+      `[claude-subscription-proxy] haiku summary: ${messages.length} messages, ` +
+        `${prompt.length} -> ${summary.length} chars (${ratio}% smaller)`
+    )
+    claudeLog("proxy.haiku.summarize", {
+      messages: messages.length,
+      inChars: prompt.length,
+      outChars: summary.length,
+      reducedPct: ratio
+    })
+    return summary
+  } catch (error) {
+    console.error("[claude-subscription-proxy] haiku summary failed:", error instanceof Error ? error.message : String(error))
+    claudeLog("proxy.haiku.summarize_failed", { error: error instanceof Error ? error.message : String(error) })
+    return ""
+  } finally {
+    discardSummarizer(entry)
+    ensureWarmSummarizer(env)
+  }
+}
+
+function buildCompactedPrompt(summary: string, tail: any[], nameToAlias: Map<string, string>): string {
+  const tailBody = tail
+    .map((m) => {
+      const role = m?.role === "assistant" ? "assistant" : "user"
+      return `<${role}>\n${renderBlocks(m?.content, nameToAlias)}\n</${role}>`
+    })
+    .join("\n")
+  return [
+    "Conversation history. Write the next assistant turn. Call tools normally; never type <tool_call>/<tool_result>.",
+    "<conversation>",
+    `<user>\n<history_summary>\n${summary}\n</history_summary>\n</user>`,
+    tailBody,
+    "</conversation>"
+  ].join("\n")
+}
+
 async function* runTurn(
   body: any,
   abort: AbortController,
@@ -1129,10 +1316,22 @@ async function* runTurn(
     }
   }
   const decision = resolveSessionForRequest(effectiveSession, messages)
-  const resume = decision.resume
-  // A known conversation resumes its own transcript, which is what keeps tokens flat as it grows.
-  const useResume = resume !== null
   const reset = decision.resetReason !== null
+
+  // History compaction. The prompt cache is per model, so a cold history (one with no Claude
+  // transcript to resume) or a mid-conversation model switch would re-send everything with no chance
+  // of a cache read. Summarise that history once with haiku and keep only the newest messages
+  // verbatim. A live transcript in the same model is never compacted: resuming reads the cached
+  // prefix, so growth there is already cheap.
+  const modelSwitch =
+    decision.resume !== null && decision.state?.model !== undefined && decision.state.model !== model
+  const coldHistory =
+    decision.resume === null && !reset && estimateHistoryTokens(messages) > COMPACT_HISTORY_TOKENS
+  const compact =
+    COMPACT_HISTORY_TOKENS > 0 && messages.length > COMPACT_KEEP_MESSAGES + 1 && (modelSwitch || coldHistory)
+  // A compacted turn starts a fresh transcript, so it never resumes the previous one.
+  const useResume = decision.resume !== null && !compact
+  const resume = useResume ? decision.resume : null
 
   // The pool is keyed by conversation, so a resuming turn can use a warm process too: that process
   // already sits on the same transcript. Only aliased retries skip it, since they change the shape.
@@ -1140,15 +1339,24 @@ async function* runTurn(
   const shape = warmShape(model, env, clientTools)
   const key = effectiveSession ? warmKey(shape, effectiveSession) : ""
   if (reset && key) discardWarmKey(key)
-  const usePool = WARM_POOL_SIZE > 0 && !forceAlias && effectiveSession !== null && !reset
+  const usePool = WARM_POOL_SIZE > 0 && !forceAlias && effectiveSession !== null && !reset && !compact
 
   const warm = usePool ? takeWarm(key, messages.length) : null
   const client = warm ? warm.client : clientTools.length > 0 ? buildClientTools(clientTools) : null
 
   const nameToAlias = client?.nameToAlias ?? new Map<string, string>()
   // On a resume the transcript already holds the history, so only the new turn is sent. Otherwise
-  // the whole conversation goes in: it becomes the transcript the next turn resumes from.
-  const prompt = useResume ? buildSessionPrompt(messages, nameToAlias) : buildPrompt(messages, nameToAlias)
+  // the whole conversation goes in: it becomes the transcript the next turn resumes from. A compacted
+  // turn sends the haiku summary plus the newest messages verbatim.
+  let prompt: string
+  if (compact) {
+    const summary = await summarizeHistory(messages.slice(0, messages.length - COMPACT_KEEP_MESSAGES))
+    prompt = summary
+      ? buildCompactedPrompt(summary, messages.slice(-COMPACT_KEEP_MESSAGES), nameToAlias)
+      : buildPrompt(messages, nameToAlias)
+  } else {
+    prompt = useResume ? buildSessionPrompt(messages, nameToAlias) : buildPrompt(messages, nameToAlias)
+  }
   // The warm replacement is a bet, not a computation: it cannot know how many blocks the reply will
   // have, so it expects the caller to come back carrying this turn's user message plus the reply.
   const expectedNextMessageCount = messages.length + 2
@@ -1160,7 +1368,7 @@ async function* runTurn(
     messages: body.messages?.length,
     tools: client?.allowed.length ?? 0,
     warm: usePool ? (warm ? "hit" : "miss") : "off",
-    session: effectiveSession ? (useResume ? "resume" : reset ? `reset:${decision.resetReason}` : "new") : "off"
+    session: effectiveSession ? (compact ? "compact" : useResume ? "resume" : reset ? `reset:${decision.resetReason}` : "new") : "off"
   })
 
   let response: Query
@@ -1285,7 +1493,8 @@ async function* runTurn(
       rememberSession(effectiveSession!, {
         id,
         messageCount: messages.length,
-        updatedAt: Date.now()
+        updatedAt: Date.now(),
+        model
       })
       // Spawn the replacement only now, holding the id this turn actually produced. Scheduling it
       // before the turn ran always resumed the previous id, so the pool forked the conversation.
