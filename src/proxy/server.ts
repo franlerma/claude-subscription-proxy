@@ -1536,6 +1536,12 @@ async function* runTurn(
         const apiError = /^API Error:\s*(\d{3})\s*([\s\S]*)$/.exec(text.trim())
         if (apiError) throw upstreamError(Number(apiError[1]), apiError[2] ?? "")
 
+        // The CLI reports a spent plan / 5-hour window as a plain text message, not an API Error
+        // line. Surface it as HTTP 429 so the caller stops instead of showing it as model output.
+        if (/hit your limit|resets \d|5.?hour|usage limit|rate.?limit|too many requests/i.test(text)) {
+          throw upstreamError(429, text.trim())
+        }
+
         // Otherwise replay the full message (e.g. other synthetic CLI messages).
         started = true
         for (const ev of eventsFromAssistantMessage(message.message, client)) {
