@@ -507,6 +507,13 @@ const STRIPPED_ENV = [
   "MAX_THINKING_TOKENS"
 ]
 
+// Claude Code auto-compacts its transcript when the context fills. The proxy runs one turn per CLI
+// process (`maxTurns: 1`) and aborts it afterwards, so compaction can only happen when the CLI loads
+// a resumed transcript that is already past its threshold. Lowering the threshold here keeps the
+// re-read transcript small instead of letting it grow unbounded (each turn re-reads it from cache).
+//   CLAUDE_PROXY_AUTOCOMPACT_PCT  % of context at which the CLI compacts on resume (default 40)
+const AUTOCOMPACT_PCT = Math.max(1, Math.min(100, envInt("CLAUDE_PROXY_AUTOCOMPACT_PCT", 40)))
+
 function buildCliEnv(): Env {
   const env: Env = { ...process.env }
   if (!AMBIENT_ENV) {
@@ -515,6 +522,10 @@ function buildCliEnv(): Env {
   // Telemetry, auto-update and feedback loops are not part of a subscription turn.
   if (env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC === undefined) {
     env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+  }
+  // Deterministic auto-compact threshold, so the proxy controls transcript size instead of the host.
+  if (env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE === undefined) {
+    env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(AUTOCOMPACT_PCT)
   }
   return env
 }
