@@ -1162,7 +1162,7 @@ function topUpWarm(
 
 const SUMMARIZE_INSTRUCTION = [
   "You are producing a compact context summary so a conversation can continue in a fresh context.",
-  "First read the most important parts of the project to understand it (README, AGENTS.md, and the files the recent messages point at).",
+  "First explore the project to understand it: read the README if it exists, any AGENTS.md or other markdown documentation, and the source files the recent messages point at. Read only what you need — do not explore exhaustively.",
   "Then produce a concise, structured summary of: what the project is, what we are currently trying to achieve, decisions made and their rationale, file paths and what changed in them, commands run and their results, and any unresolved next steps.",
   "Output only the summary, with no preamble."
 ].join(" ")
@@ -1225,10 +1225,8 @@ function spawnSummarizer(env: Env): Summarizer {
     allowedTools: ["Read", "Glob", "Grep"],
     disallowedTools: ["Bash", "Edit", "Write", "WebFetch", "WebSearch", "Task", "TodoWrite"],
     settingSources: [],
-    // Room for a few tool_use rounds (read files) before the final summary text. With maxTurns: 1 the
-    // summarizer would stop at the first Read and return no text. The single input message still ends
-    // the stream, so this only bounds how many Read/Glob rounds the agent may take.
-    maxTurns: 5,
+    // No maxTurns cap: the prompt tells it to read only what it needs, and the single input message
+    // ends the stream. A cap here would stop it mid-read and return no summary text.
     includePartialMessages: false,
     persistSession: false,
     abortController: abort,
