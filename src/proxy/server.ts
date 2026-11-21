@@ -1552,8 +1552,9 @@ async function* runTurn(
       // expected
     } else {
       // The CLI wraps upstream failures as a bare exit code; the real cause (e.g. a 429) is only on
-      // its stderr. Surface a rate limit as HTTP 429 immediately instead of a generic 500.
+      // its stderr. Always print it, then surface a rate limit as HTTP 429 instead of a generic 500.
       const stderr = stderrBuf()
+      if (stderr) console.error(`[claude-subscription-proxy] CLI stderr:\n${stderr.slice(0, 1500)}`)
       if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
         throw upstreamError(429, stderr.slice(0, 1000))
       }
