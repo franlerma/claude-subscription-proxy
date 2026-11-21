@@ -1,7 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import type { Query } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
-import { ProxyError, upstreamError } from "./errors"
+import { ProxyError, upstreamError, isRateLimitText } from "./errors"
 import type { StreamEvent } from "./errors"
 import { resolveModel, aliasForModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
 import { buildClientTools, originalToolName, type ClientTools } from "./tools"
@@ -73,6 +73,54 @@ function* eventsFromAssistantMessage(m: any, client: ClientTools | null): Genera
     usage: { output_tokens: m.usage?.output_tokens ?? 0 }
   }
   yield { type: "message_stop" }
+}
+
+/** The error to rethrow for a CLI failure. Returns the error unchanged when no stderr explains it. */
+function cliFailure(error: unknown, stderr: string): unknown {
+  // The CLI wraps upstream failures as a bare exit code; the real cause (e.g. a 429) is only on
+  // its stderr. Always print it, then surface a rate limit as HTTP 429 instead of a generic 500.
+  if (stderr) console.error(`[claude-subscription-proxy] CLI stderr:\n${stderr.slice(0, 1500)}`)
+  if (isRateLimitText(stderr)) return upstreamError(429, stderr.slice(0, 1000))
+  if (stderr && error instanceof Error && /process exited|no message/i.test(error.message)) {
+    return new Error(`${error.message}: ${stderr.slice(0, 1000)}`)
+  }
+  return error
+}
+
+interface TurnOutcome {
+  /** Conversation key, or null when the turn is not tracked. */
+  session: string | null
+  started: boolean
+  completed: boolean
+  result: string | null
+  resumedId: string | null
+  messageCount: number
+  model: string
+  /** Replenishes the warm pool for the session id this turn produced. Null when the pool is off. */
+  topUp: ((id: string) => void) | null
+}
+
+/** Records the session id this turn produced, or drops the mapping when the transcript is unknown. */
+function persistTurn(o: TurnOutcome) {
+  // Keep the id we resumed from when the turn completed without a `result`: deleting it would force
+  // the next turn to replay the whole history cold.
+  const id = o.result ?? (o.completed ? o.resumedId : null)
+  if (o.session && id) {
+    claudeLog("proxy.session.remember", {
+      sid: id.slice(0, 8),
+      messages: o.messageCount,
+      completed: o.completed,
+      viaResult: o.result !== null
+    })
+    rememberSession(o.session, { id, messageCount: o.messageCount, updatedAt: Date.now(), model: o.model })
+    // Only a `result` proves the transcript was flushed; without it a warm process could resume a
+    // half-written transcript, so the pool is left cold for one turn instead.
+    if (o.result !== null) o.topUp?.(id)
+  } else if (o.session && o.started) {
+    // The turn emitted output but produced no session id: the mapping would keep pointing at the
+    // pre-compaction transcript, so drop it. A failure before the first token leaves it intact.
+    deleteSession(o.session)
+  }
 }
 
 async function* runTurn(
@@ -293,21 +341,7 @@ async function* runTurn(
     if (!started) throw new Error("Claude Code returned no message")
   } catch (error) {
     // Aborting after we got what we needed is expected and not an error.
-    if (started && abort.signal.aborted) {
-      // expected
-    } else {
-      // The CLI wraps upstream failures as a bare exit code; the real cause (e.g. a 429) is only on
-      // its stderr. Always print it, then surface a rate limit as HTTP 429 instead of a generic 500.
-      const stderr = stderrBuf()
-      if (stderr) console.error(`[claude-subscription-proxy] CLI stderr:\n${stderr.slice(0, 1500)}`)
-      if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
-        throw upstreamError(429, stderr.slice(0, 1000))
-      }
-      if (stderr && error instanceof Error && /process exited|no message/i.test(error.message)) {
-        throw new Error(`${error.message}: ${stderr.slice(0, 1000)}`)
-      }
-      throw error
-    }
+    if (!(started && abort.signal.aborted)) throw cliFailure(error, stderrBuf())
   } finally {
     // Always let the CLI finish writing its transcript and report the session id, even when the
     // caller already got its message. Killing it here is what left nothing to resume from.
@@ -315,41 +349,18 @@ async function* runTurn(
     if (result === null && track) {
       await new Promise((resolve) => setTimeout(resolve, SESSION_FLUSH_MS))
     }
-    // A turn that already emitted its message but whose CLI ended without a `result` (the process
-    // was killed, or the stream closed early) still owns the transcript it resumed from. Deleting
-    // the session there is what forced the next turn to replay the whole history cold - the exact
-    // case the cache cannot survive. Keep the id we resumed from instead of throwing it away.
-    const resumedId = warm?.resume ?? resume
-    const id = result ?? (completed ? resumedId : null)
-    if (track && id) {
-      claudeLog("proxy.session.remember", {
-        sid: id.slice(0, 8),
-        messages: messages.length,
-        completed,
-        viaResult: result !== null
-      })
-      rememberSession(effectiveSession!, {
-        id,
-        messageCount: messages.length,
-        updatedAt: Date.now(),
-        model
-      })
-      // Spawn the replacement only now, holding the id this turn actually produced. Scheduling it
-      // before the turn ran always resumed the previous id, so the pool forked the conversation.
-      // Only a `result` proves the transcript was flushed; without it a warm process could resume a
-      // half-written transcript, so the pool is left cold for one turn instead.
-      if (usePool && result !== null) {
-        topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
-      }
-    } else if (track && started) {
-      // The turn emitted output but did not yield a session id to remember: either it never
-      // finished, or it was a compacted turn whose new transcript is unknown. The mapping would
-      // otherwise keep pointing at the pre-compaction transcript, so drop it and let a later turn
-      // replay the history. A failure before the first token (a 429, a CLI that never started)
-      // leaves the previous transcript intact - keep it, both because it is still valid and because
-      // dropping it turns the next turn into a cold replay.
-      deleteSession(effectiveSession!)
-    }
+    persistTurn({
+      session: effectiveSession,
+      started,
+      completed,
+      result,
+      resumedId: warm?.resume ?? resume,
+      messageCount: messages.length,
+      model,
+      topUp: usePool
+        ? (id) => topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
+        : null
+    })
     abort.abort()
     releasePending?.()
   }
@@ -387,7 +398,7 @@ export async function* runTurnWithFallback(
     // alias would just be a second doomed call against the same subscription. Only a genuine
     // model-id rejection (and never a rate limit) is worth a retry.
     if (error instanceof ProxyError && error.status === 429) throw error
-    if (/rate.?limit|usage limit|hit your limit|too many requests|overloaded/i.test(message)) throw error
+    if (isRateLimitText(message)) throw error
     console.error("[claude-subscription-proxy] exact model rejected, retrying with alias:", body.model, "-", message.slice(0, 200))
   }
   yield* runTurn(body, new AbortController(), true, callerSession)

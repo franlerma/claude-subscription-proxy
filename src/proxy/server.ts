@@ -3,7 +3,8 @@ import type { Context } from "hono"
 import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { claudeLog } from "../logger"
-import { ProxyError } from "./errors"
+import { ProxyError, isRateLimitText } from "./errors"
+import { version as PROXY_VERSION } from "../../package.json"
 import type { StreamEvent } from "./errors"
 import { runTurnWithFallback } from "./turn"
 import { sessionKey, startSessionSweeper } from "./session"
@@ -86,7 +87,7 @@ async function collectMessage(events: AsyncGenerator<StreamEvent>, fallbackModel
 // ---------------------------------------------------------------------------------------
 
 function errorStatus(message: string): 429 | 500 {
-  return /rate.?limit|usage limit|hit your limit|too many requests|overloaded/i.test(message) ? 429 : 500
+  return isRateLimitText(message) ? 429 : 500
 }
 
 export function createProxyServer(config: Partial<ProxyConfig> = {}) {
@@ -97,7 +98,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     return c.json({
       status: "ok",
       service: "claude-subscription-proxy",
-      version: "1.0.2",
+      version: PROXY_VERSION,
       format: "anthropic",
       endpoints: ["/v1/messages", "/messages"]
     })

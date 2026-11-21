@@ -4,7 +4,7 @@ import { claudeLog } from "../logger"
 import { claudeExecutable } from "./models"
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY, renderBlocks } from "./prompt"
 import { buildCliEnv, type Env, SESSION_MODE, SESSION_CONFIG_DIR, WARM_POOL_TTL_MS } from "./env"
-import { upstreamError } from "./errors"
+import { upstreamError, isRateLimitText } from "./errors"
 
 // ---------------------------------------------------------------------------------------
 // Haiku summarizer (history compaction)
@@ -194,7 +194,7 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
     // CLI's own stderr: the exit code alone hides the real reason (429, etc.).
     const stderr = entry?.stderr.join("").trim() ?? ""
     if (stderr) console.error(`[claude-subscription-proxy] haiku CLI stderr:\n${stderr.slice(0, 1500)}`)
-    if (/rate.?limit|429|usage limit|hit your limit|too many requests|overloaded/i.test(stderr)) {
+    if (isRateLimitText(stderr)) {
       const rl = upstreamError(429, stderr.slice(0, 1000))
       console.error("[claude-subscription-proxy] haiku summary failed:", rl.message)
       claudeLog("proxy.haiku.summarize_failed", { error: rl.message })
