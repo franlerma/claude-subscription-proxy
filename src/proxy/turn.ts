@@ -3,7 +3,7 @@ import type { Query } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
 import { ProxyError, upstreamError, isRateLimitText } from "./errors"
 import type { StreamEvent } from "./errors"
-import { resolveModel, aliasForModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
+import { resolveModel, aliasForModel, sameModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
 import { buildClientTools, originalToolName, type ClientTools } from "./tools"
 import { systemText, buildPrompt, buildSessionPrompt, buildCompactedPrompt } from "./prompt"
 import {
@@ -152,6 +152,10 @@ async function* runTurn(
   // Helpers never need the conversation's model: route them to a cheap alias so a title costs a
   // haiku call instead of a Sonnet/Opus one. The caller's `thinking` budget is forwarded as-is.
   const model = resolveModel(helperRequest ? HELPER_MODEL : body.model, forceAlias)
+  // What the caller asked for, version included. The resolved `model` can be a bare CLI alias (after
+  // the alias fallback, or for non-Claude names), which has lost the version. Session state and the
+  // model-switch check use this one so a fallback never looks like a switch to another version.
+  const requestedModel = typeof body.model === "string" && body.model ? body.model : model
   const maxThinkingTokens = thinkingBudget(body.thinking)
   const track = callerSession !== null && !helperRequest
   const effectiveSession = track ? callerSession : null
@@ -174,7 +178,7 @@ async function* runTurn(
   // verbatim. A live transcript in the same model is never compacted: resuming reads the cached
   // prefix, so growth there is already cheap.
   const modelSwitch =
-    decision.resume !== null && decision.state?.model !== undefined && decision.state.model !== model
+    decision.resume !== null && decision.state?.model !== undefined && !sameModel(decision.state.model, requestedModel)
   const coldHistory =
     decision.resume === null && !reset && estimateHistoryTokens(messages) > COMPACT_HISTORY_TOKENS
   const compact =
@@ -370,7 +374,7 @@ async function* runTurn(
       result,
       resumedId: warm?.resume ?? resume,
       messageCount: messages.length,
-      model,
+      model: requestedModel,
       topUp: usePool
         ? (id) => topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
         : null

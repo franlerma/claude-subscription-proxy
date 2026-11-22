@@ -35,7 +35,7 @@ export interface SessionState {
   id: string
   messageCount: number
   updatedAt: number
-  /** Model the transcript was last served with, to detect a model switch mid-conversation. */
+  /** Model the caller last asked for (version included), to detect a model switch mid-conversation. */
   model?: string
   /** In-memory TTL timer; never persisted. */
   timer?: ReturnType<typeof setTimeout>
