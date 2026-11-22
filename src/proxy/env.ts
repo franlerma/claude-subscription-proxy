@@ -1,5 +1,6 @@
 import { join } from "path"
 import { homedir } from "os"
+import { mkdirSync } from "fs"
 import { claudeExecutable } from "./models"
 import { CLIENT_MCP_SERVER, type ClientTools } from "./tools"
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY, callerSystemBlock, renderBlocks } from "./prompt"
@@ -20,6 +21,7 @@ export function buildOptions(
   const options: Record<string, any> = {
     model,
     pathToClaudeCodeExecutable: claudeExecutable,
+    cwd: PROXY_CWD,
     // Keep Claude Code's own system prompt and append the caller's prompt after the dynamic boundary.
     // Appending the caller text directly (without the boundary) re-classifies the request as
     // third-party, which bills "extra usage" instead of the subscription.
@@ -102,6 +104,11 @@ export const SESSION_FLUSH_MS = Math.max(0, envInt("CLAUDE_PROXY_SESSION_FLUSH_M
 export const SESSION_CONFIG_DIR =
   process.env.CLAUDE_PROXY_CONFIG_DIR?.trim() ||
   join(homedir(), ".claude-proxy")
+// Neutral cwd for the CLI. It is what the preset prints in <env>, so it must not leak the proxy's
+// install dir to remote callers. It must stay constant: transcripts live under projects/<cwd>, so
+// changing it breaks resume.
+export const PROXY_CWD = join(SESSION_CONFIG_DIR, "proxy-sandbox")
+mkdirSync(PROXY_CWD, { recursive: true })
 // How many leading messages define a conversation identity when the caller sends no session header.
 // Keep this at 1: a conversation's first request often has only one message, so hashing two would
 // change the key on turn two (the second message appears) and silently start a new transcript.

@@ -3,7 +3,7 @@ import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
 import { claudeExecutable } from "./models"
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY, renderBlocks } from "./prompt"
-import { buildCliEnv, type Env, SESSION_MODE, SESSION_CONFIG_DIR, WARM_POOL_TTL_MS } from "./env"
+import { buildCliEnv, type Env, PROXY_CWD, SESSION_MODE, SESSION_CONFIG_DIR, WARM_POOL_TTL_MS } from "./env"
 import { upstreamError, isRateLimitText } from "./errors"
 
 // ---------------------------------------------------------------------------------------
@@ -72,6 +72,7 @@ function spawnSummarizer(env: Env): Summarizer {
   const options: Record<string, any> = {
     model: "haiku",
     pathToClaudeCodeExecutable: claudeExecutable,
+    cwd: PROXY_CWD,
     systemPrompt: {
       type: "preset" as const,
       preset: "claude_code" as const,

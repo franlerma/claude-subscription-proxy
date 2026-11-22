@@ -73,7 +73,7 @@ export function renderBlocks(content: unknown, nameToAlias: Map<string, string>)
 export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
 const CWD_HINT =
-  "File tools run in the caller's project, not the proxy. Ignore <env> cwd; pass the user's path verbatim. Never touch proxy files."
+  "The first <env> block (and its working directory) belongs to the proxy's empty sandbox, not to the user. The user's real working directory is the one in the caller's own environment above. If none is given, use relative paths or ask the user; never assume the proxy's path."
 
 export function callerSystemBlock(system: string): string {
   return ["<caller_system_prompt>", system, CWD_HINT, "</caller_system_prompt>"].join("\n")
