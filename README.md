@@ -217,6 +217,7 @@ journalctl -u claude-subscription-proxy -f
 | `CLAUDE_PROXY_SESSION_FINGERPRINT` | 1 | Number of leading messages hashed to identify a conversation when the caller sends no session header. Keep it at `1`; with more, the second message changes the key on turn two and starts a new transcript. |
 | `CLAUDE_PROXY_SESSION_FLUSH_MS` | 750 | Time granted to the CLI to write its transcript before the process is torn down |
 | `CLAUDE_PROXY_CONFIG_DIR` | `~/.claude-proxy` | Where resumed transcripts and the per-session map (`sessions/<sha256>.json`) live. Kept separate from `~/.claude` so TTL cleanup never touches a real Claude Code install; credentials are symlinked from there on startup. |
+| `CLAUDE_PROXY_SUMMARY_TIMEOUT_MS` | 30000 | Upper bound for one haiku history summary (CLI start-up included). When it expires the request fails with a 504 instead of replaying the whole cold history. The summary duration is logged (`haiku summary: ... in NNNms`), so tune it from real numbers. |
 | `CLAUDE_PROXY_AMBIENT_ENV` | 0 (off) | When `1`, keeps ambient Anthropic/CLI environment variables instead of stripping them. Debug escape hatch: ambient `ANTHROPIC_API_KEY` silently switches to API-key billing, `CLAUDE_CODE_FORCE_GLOBAL_CACHE` switches to the global cache, and `MAX_THINKING_TOKENS` turns thinking on for every turn. |
 
 

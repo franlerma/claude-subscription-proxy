@@ -137,6 +137,11 @@ export const COMPACT_HISTORY_TOKENS = (() => {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_COMPACT_HISTORY_TOKENS
 })()
 export const COMPACT_KEEP_MESSAGES = Math.max(1, envInt("CLAUDE_PROXY_COMPACT_KEEP_MESSAGES", 4))
+// Upper bound for one haiku summary, CLI start-up included. A hung summarizer would otherwise hang
+// the main request that is waiting for it. On timeout the request fails with a 504 instead of
+// replaying the whole cold history.
+//   CLAUDE_PROXY_SUMMARY_TIMEOUT_MS  (default 30000)
+export const SUMMARY_TIMEOUT_MS = Math.max(1000, envInt("CLAUDE_PROXY_SUMMARY_TIMEOUT_MS", 30_000))
 
 // ---------------------------------------------------------------------------------------
 // Helper requests

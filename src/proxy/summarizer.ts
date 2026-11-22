@@ -3,8 +3,16 @@ import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
 import { claudeExecutable } from "./models"
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY, renderBlocks } from "./prompt"
-import { buildCliEnv, type Env, PROXY_CWD, SESSION_MODE, SESSION_CONFIG_DIR, WARM_POOL_TTL_MS } from "./env"
-import { upstreamError, isRateLimitText } from "./errors"
+import {
+  buildCliEnv,
+  type Env,
+  PROXY_CWD,
+  SESSION_MODE,
+  SESSION_CONFIG_DIR,
+  WARM_POOL_TTL_MS,
+  SUMMARY_TIMEOUT_MS
+} from "./env"
+import { ProxyError, upstreamError, isRateLimitText } from "./errors"
 
 // ---------------------------------------------------------------------------------------
 // Haiku summarizer (history compaction)
@@ -29,6 +37,8 @@ const SUMMARIZE_INSTRUCTION = [
 // chars (~3k tokens), which is enough for the current intent and the immediate tool results.
 const SUMMARIZE_TAIL_MESSAGES = 8
 const SUMMARIZE_TAIL_CHARS = 12_000
+
+const summaryTimeout = () => new ProxyError(`haiku summary timed out after ${SUMMARY_TIMEOUT_MS}ms`, 504)
 
 /** The recent history tail, oldest-first, capped by message count and char budget. */
 function recentHistory(messages: any[]): string {
@@ -175,18 +185,36 @@ export async function summarizeHistory(messages: any[]): Promise<string> {
       warmSummarizerTimer = null
     }
 
-    const summary = await runSummarizer(entry, tail)
+    // A hung haiku would hang the main request waiting for it. Race against a timer instead of
+    // relying on the discarded process to end its iterator: the timeout must fire even if the CLI
+    // never answers or ignores close(). The losing promise is still handled by the race.
+    const current = entry
+    const startedAt = Date.now()
+    let timer!: ReturnType<typeof setTimeout>
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        discardSummarizer(current)
+        reject(summaryTimeout())
+      }, SUMMARY_TIMEOUT_MS)
+    })
+    let summary: string
+    try {
+      summary = await Promise.race([runSummarizer(current, tail), timeout])
+    } finally {
+      clearTimeout(timer)
+    }
     if (!summary) throw new Error("haiku summary returned no text")
     const ratio = inChars > 0 ? Math.round((1 - summary.length / inChars) * 100) : 0
     console.log(
       `[claude-subscription-proxy] haiku summary: ${messages.length} messages total, ` +
-        `${inChars} -> ${summary.length} chars (${ratio}% smaller)`
+        `${inChars} -> ${summary.length} chars (${ratio}% smaller) in ${Date.now() - startedAt}ms`
     )
     claudeLog("proxy.haiku.summarize", {
       messages: messages.length,
       inChars,
       outChars: summary.length,
-      reducedPct: ratio
+      reducedPct: ratio,
+      ms: Date.now() - startedAt
     })
     return summary
   } catch (error) {
