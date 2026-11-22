@@ -297,6 +297,9 @@ export function rememberSession(key: string, state: SessionState) {
   if (!state.id) return
   const previous = sessions.get(key)
   if (previous?.timer) clearTimeout(previous.timer)
+  // Re-insert so Map order stays recency order: `set` on an existing key keeps its old position,
+  // which would evict an active conversation before an idle one.
+  sessions.delete(key)
   sessions.set(key, state)
   while (sessions.size > SESSION_MAX) {
     const oldest = sessions.keys().next().value as string
