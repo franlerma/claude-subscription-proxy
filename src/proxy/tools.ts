@@ -122,10 +122,12 @@ export function buildClientTools(tools: Array<{ name: string; description?: stri
       alias,
       t.description || t.name,
       cachedShape(t.input_schema) as any,
-      // Never meant to run: the turn is aborted as soon as the model emits the tool_use.
+      // Never does real work: the client runs the tool and sends its result in the next message. The
+      // CLI still executes this handler and persists its output in the transcript right after every
+      // tool_use, so the text must read as a neutral hand-off. An `isError` result would have the model
+      // re-read every one of its tool calls as a failure, followed by the real result as plain text.
       async () => ({
-        content: [{ type: "text" as const, text: "This tool is executed by the client, not by the proxy." }],
-        isError: true
+        content: [{ type: "text" as const, text: "Result delivered in the next message." }]
       })
     )
   })

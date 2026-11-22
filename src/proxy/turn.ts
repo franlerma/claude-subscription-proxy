@@ -3,7 +3,7 @@ import type { Query } from "@anthropic-ai/claude-agent-sdk"
 import { claudeLog } from "../logger"
 import { ProxyError, upstreamError, isRateLimitText } from "./errors"
 import type { StreamEvent } from "./errors"
-import { resolveModel, aliasForModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
+import { resolveModel, aliasForModel, sameModel, DEFAULT_MAX_OUTPUT_TOKENS, thinkingBudget } from "./models"
 import { buildClientTools, originalToolName, type ClientTools } from "./tools"
 import { systemText, buildPrompt, buildSessionPrompt, buildCompactedPrompt } from "./prompt"
 import {
@@ -123,6 +123,11 @@ function persistTurn(o: TurnOutcome) {
   }
 }
 
+/**
+ * `abort` belongs to the caller (HTTP client). It is only listened to here, never aborted: the CLI
+ * process gets its own controller, so finishing a turn cannot be mistaken for a client disconnect
+ * (which used to disable the alias fallback) and a retry can share the caller's real signal.
+ */
 async function* runTurn(
   body: any,
   abort: AbortController,
@@ -147,6 +152,10 @@ async function* runTurn(
   // Helpers never need the conversation's model: route them to a cheap alias so a title costs a
   // haiku call instead of a Sonnet/Opus one. The caller's `thinking` budget is forwarded as-is.
   const model = resolveModel(helperRequest ? HELPER_MODEL : body.model, forceAlias)
+  // What the caller asked for, version included. The resolved `model` can be a bare CLI alias (after
+  // the alias fallback, or for non-Claude names), which has lost the version. Session state and the
+  // model-switch check use this one so a fallback never looks like a switch to another version.
+  const requestedModel = typeof body.model === "string" && body.model ? body.model : model
   const maxThinkingTokens = thinkingBudget(body.thinking)
   const track = callerSession !== null && !helperRequest
   const effectiveSession = track ? callerSession : null
@@ -169,7 +178,7 @@ async function* runTurn(
   // verbatim. A live transcript in the same model is never compacted: resuming reads the cached
   // prefix, so growth there is already cheap.
   const modelSwitch =
-    decision.resume !== null && decision.state?.model !== undefined && decision.state.model !== model
+    decision.resume !== null && decision.state?.model !== undefined && !sameModel(decision.state.model, requestedModel)
   const coldHistory =
     decision.resume === null && !reset && estimateHistoryTokens(messages) > COMPACT_HISTORY_TOKENS
   const compact =
@@ -220,15 +229,21 @@ async function* runTurn(
   let response: Query
   const coldStderr: string[] = []
   const stderrBuf = () => (warm ? warm.stderr : coldStderr).join("").trim()
+  // The CLI process has its own controller (a warm one already does). The caller's abort is forwarded
+  // only until message_stop: after that the caller has its message, and killing the CLI before its
+  // `result` would lose the session id and the transcript the next turn resumes from.
+  const cli = warm ? warm.abort : new AbortController()
+  let completed = false
+  const onClientAbort = () => {
+    if (!completed) cli.abort()
+  }
+  if (abort.signal.aborted) onClientAbort()
+  else abort.signal.addEventListener("abort", onClientAbort, { once: true })
   if (warm) {
-    // The warm CLI has its own AbortController: forward the request's abort to it.
-    const kill = () => warm.abort.abort()
-    if (abort.signal.aborted) kill()
-    else abort.signal.addEventListener("abort", kill, { once: true })
     warm.send(prompt)
     response = warm.query
   } else {
-    const options = buildOptions(model, env, client, abort, track, system, coldStderr, maxThinkingTokens) as any
+    const options = buildOptions(model, env, client, cli, track, system, coldStderr, maxThinkingTokens) as any
     if (useResume) {
       options.resume = resume
     }
@@ -254,7 +269,6 @@ async function* runTurn(
   // which is exactly the `tool_use` case (every proxy turn ends that way). So the loop keeps
   // consuming the CLI without emitting anything after the first message, then remembers the id.
   let done = false
-  let completed = false
   let result: string | null = null
 
   try {
@@ -308,13 +322,14 @@ async function* runTurn(
           )
         }
 
-        yield event
         if (event.type === "message_stop") {
-          completed = true
-          // Stop emitting, but keep draining the CLI: only its `result` carries the session id and
+          // Flag before yielding: from this point a client disconnect must not abort the CLI.
+          // Stop emitting, but keep draining it: only its `result` carries the session id and
           // only after that does it flush the transcript we need for the next turn.
+          completed = true
           done = true
         }
+        yield event
       } else if (message.type === "assistant" && !started) {
         // No partial events were produced. The CLI reports upstream failures as a synthetic assistant
         // message ("API Error: 400 {...}"): surface those as real HTTP errors, not as model output.
@@ -334,17 +349,17 @@ async function* runTurn(
 
         // Otherwise replay the full message (e.g. other synthetic CLI messages).
         started = true
+        completed = true
+        done = true
         for (const ev of eventsFromAssistantMessage(message.message, client)) {
           yield ev
         }
-        completed = true
-        done = true
       }
     }
     if (!started) throw new Error("Claude Code returned no message")
   } catch (error) {
     // Aborting after we got what we needed is expected and not an error.
-    if (!(started && abort.signal.aborted)) throw cliFailure(error, stderrBuf())
+    if (!(started && cli.signal.aborted)) throw cliFailure(error, stderrBuf())
   } finally {
     // Always let the CLI finish writing its transcript and report the session id, even when the
     // caller already got its message. Killing it here is what left nothing to resume from.
@@ -359,12 +374,13 @@ async function* runTurn(
       result,
       resumedId: warm?.resume ?? resume,
       messageCount: messages.length,
-      model,
+      model: requestedModel,
       topUp: usePool
         ? (id) => topUpWarm(key, model, env, clientTools, system, id, expectedNextMessageCount, maxThinkingTokens)
         : null
     })
-    abort.abort()
+    abort.signal.removeEventListener("abort", onClientAbort)
+    cli.abort()
     releasePending?.()
   }
 }
@@ -393,7 +409,7 @@ export async function* runTurnWithFallback(
       claudeLog("proxy.session.stale", { key: callerSession.slice(0, 12) })
       // Keep the caller key: the retry replays the full history and records the new transcript
       // under the same conversation, so the following turn can resume again.
-      yield* runTurn(body, new AbortController(), false, callerSession)
+      yield* runTurn(body, abort, false, callerSession)
       return
     }
     if (started || !exact || !/model/i.test(message) || abort.signal.aborted) throw error
@@ -404,5 +420,5 @@ export async function* runTurnWithFallback(
     if (isRateLimitText(message)) throw error
     console.error("[claude-subscription-proxy] exact model rejected, retrying with alias:", body.model, "-", message.slice(0, 200))
   }
-  yield* runTurn(body, new AbortController(), true, callerSession)
+  yield* runTurn(body, abort, true, callerSession)
 }

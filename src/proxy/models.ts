@@ -45,6 +45,23 @@ export function resolveModel(model: unknown, forceAlias = false): string {
 }
 
 /**
+ * True when two resolved model strings share a prompt cache. A dated snapshot ("claude-x-20250929"),
+ * its undated id and "-latest" are one model, and a bare CLI alias stands for its family. Different
+ * versions or families stay different: those are real switches. Comparing with `!==` treated an exact
+ * id and its alias (e.g. after the alias fallback) as a switch, which compacted and threw away a
+ * perfectly good cached transcript.
+ */
+export function sameModel(a: string, b: string): boolean {
+  const normalize = (m: string) => m.toLowerCase().replace(/-(\d{8}|latest)$/, "")
+  const isAlias = (m: string) => m === "sonnet" || m === "opus" || m === "haiku"
+  const x = normalize(a)
+  const y = normalize(b)
+  if (x === y) return true
+  if (isAlias(x) || isAlias(y)) return aliasForModel(x) === aliasForModel(y)
+  return false
+}
+
+/**
  * Maps the Anthropic `thinking` parameter to the CLI's `maxThinkingTokens`. Returning `undefined`
  * leaves the CLI's own default untouched; only an explicit `disabled` (0) or `enabled` budget
  * overrides it. Without this the caller's thinking intent was simply dropped and the CLI's default

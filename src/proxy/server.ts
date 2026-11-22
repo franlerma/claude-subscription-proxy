@@ -125,6 +125,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const encoder = new TextEncoder()
       const sse = (ev: StreamEvent) => encoder.encode(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`)
 
+      // Once the client is gone we keep draining `events` instead of closing the generator: the turn
+      // still has to read the CLI's `result` to remember the session. `runTurn` aborts the CLI itself
+      // when the disconnect arrives before `message_stop`.
+      let cancelled = false
       const readable = new ReadableStream({
         async start(controller) {
           const heartbeat = setInterval(() => {
@@ -135,14 +139,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }, 10_000)
           try {
-            if (!first.done) controller.enqueue(sse(first.value))
-            for await (const ev of events) controller.enqueue(sse(ev))
+            if (!first.done && !cancelled) controller.enqueue(sse(first.value))
+            for await (const ev of events) {
+              if (!cancelled) controller.enqueue(sse(ev))
+            }
           } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            console.error("[claude-subscription-proxy] stream error:", message)
-            try {
-              controller.enqueue(sse({ type: "error", error: { type: "api_error", message } }))
-            } catch {}
+            if (!cancelled) {
+              const message = error instanceof Error ? error.message : String(error)
+              console.error("[claude-subscription-proxy] stream error:", message)
+              try {
+                controller.enqueue(sse({ type: "error", error: { type: "api_error", message } }))
+              } catch {}
+            }
           } finally {
             clearInterval(heartbeat)
             try {
@@ -151,8 +159,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           }
         },
         cancel() {
+          cancelled = true
           abort.abort()
-          void events.return?.(undefined)
         }
       })
 
